@@ -12,6 +12,7 @@
 
 #define BOOTCONFIG_MAGIC	"#BOOTCONFIG\n"
 #define BOOTCONFIG_MAGIC_LEN	12
+#define BOOTCONFIG_ALIGN	4
 
 /* XBC tree node */
 struct xbc_node {

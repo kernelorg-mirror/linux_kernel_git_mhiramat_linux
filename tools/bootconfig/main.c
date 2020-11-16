@@ -336,7 +336,8 @@ static int apply_xbc(const char *path, const char *xbc_path)
 	char *buf, *data;
 	int ret, fd;
 	const char *msg;
-	int pos;
+	struct stat st;
+	int pos, pad;
 
 	ret = load_xbc_file(xbc_path, &buf);
 	if (ret < 0) {
@@ -365,9 +366,6 @@ static int apply_xbc(const char *path, const char *xbc_path)
 	}
 	printf("Apply %s to %s\n", xbc_path, path);
 	printf("\tNumber of nodes: %d\n", ret);
-	printf("\tSize: %u bytes\n", (unsigned int)size);
-	printf("\tChecksum: %d\n", (unsigned int)csum);
-
 	/* TODO: Check the options by schema */
 	xbc_destroy_all();
 	free(buf);
@@ -387,6 +385,30 @@ static int apply_xbc(const char *path, const char *xbc_path)
 		free(data);
 		return fd;
 	}
+
+	/* To algin up the total size to BOOTCONFIG_ALIGN, get the padding size */
+	ret = fstat(fd, &st);
+	if (ret < 0) {
+		pr_err("Failed to get the stat of %s\n", path);
+		free(data);
+		return ret;
+	}
+	pad = BOOTCONFIG_ALIGN - (st.st_size + size) % BOOTCONFIG_ALIGN;
+	if (pad != BOOTCONFIG_ALIGN) {
+		/* Update size and checksum with padding spaces */
+		*(u32 *)(data + size) += pad;
+		*(u32 *)(data + size + 4) += (int)' ' * pad;
+
+		/* Write padding spaces */
+		ret = write(fd, "   ", pad);
+		if (ret < 0) {
+			pr_err("Failed to write padding spaces: %d\n", ret);
+			goto out;
+		}
+	}
+	printf("\tSize: %u bytes\n", (unsigned int)*(u32 *)(data + size));
+	printf("\tChecksum: %d\n", (unsigned int)*(u32 *)(data + size + 4));
+
 	/* TODO: Ensure the @path is initramfs/initrd image */
 	ret = write(fd, data, size + 8);
 	if (ret < 0) {
