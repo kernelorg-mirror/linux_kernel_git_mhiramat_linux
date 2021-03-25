@@ -5376,15 +5376,15 @@ static int preempt_dynamic_mode = preempt_dynamic_full;
 static int sched_dynamic_mode(const char *str)
 {
 	if (!strcmp(str, "none"))
-		return 0;
+		return preempt_dynamic_none;
 
 	if (!strcmp(str, "voluntary"))
-		return 1;
+		return preempt_dynamic_voluntary;
 
 	if (!strcmp(str, "full"))
-		return 2;
+		return preempt_dynamic_full;
 
-	return -1;
+	return -EINVAL;
 }
 
 static void sched_dynamic_update(int mode)
