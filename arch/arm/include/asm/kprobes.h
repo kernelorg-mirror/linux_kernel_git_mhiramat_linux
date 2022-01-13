@@ -56,8 +56,7 @@ extern __visible kprobe_opcode_t optprobe_template_restore_end[];
 
 #define MAX_OPTIMIZED_LENGTH	4
 #define MAX_OPTINSN_SIZE				\
-	((unsigned long)optprobe_template_end -	\
-	 (unsigned long)optprobe_template_entry)
+	(unsigned long)(optprobe_template_end - optprobe_template_entry)
 #define RELATIVEJUMP_SIZE	4
 
 struct arch_optimized_insn {
