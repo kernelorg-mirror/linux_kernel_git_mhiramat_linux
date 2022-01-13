@@ -8,6 +8,7 @@
 #include <asm/ppc_asm.h>
 #include <asm/ptrace.h>
 #include <asm/asm-offsets.h>
+#include <asm/kprobes.h>
 
 #ifdef CONFIG_PPC64
 #define SAVE_30GPRS(base) SAVE_10GPRS(2,base); SAVE_10GPRS(12,base); SAVE_10GPRS(22,base)
@@ -19,8 +20,6 @@
 #define TEMPLATE_FOR_IMM_LOAD_INSNS	nop; nop; nop
 #endif
 
-#define	OPT_SLOT_SIZE	65536
-
 	.balign	4
 
 	/*
@@ -30,7 +29,7 @@
 	 */
 	.global optinsn_slot
 optinsn_slot:
-	.space	OPT_SLOT_SIZE
+	.space	KPROBE_OPTINSN_SLOT_SIZE
 
 	/*
 	 * Optprobe template:

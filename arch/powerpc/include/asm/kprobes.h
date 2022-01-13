@@ -4,6 +4,8 @@
 
 #include <asm-generic/kprobes.h>
 
+#ifndef __ASSEMBLY__
+
 #ifdef __KERNEL__
 /*
  *  Kernel Probes (KProbes)
@@ -94,4 +96,8 @@ static inline int kprobe_handler(struct pt_regs *regs) { return 0; }
 static inline int kprobe_post_handler(struct pt_regs *regs) { return 0; }
 #endif /* CONFIG_KPROBES */
 #endif /* __KERNEL__ */
+#endif /* __ASSEMBLY__ */
+
+#define KPROBE_OPTINSN_SLOT_SIZE        65536
+
 #endif	/* _ASM_POWERPC_KPROBES_H */

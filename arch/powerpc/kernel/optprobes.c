@@ -25,19 +25,32 @@
 #define TMPL_INSN_IDX		(optprobe_template_insn - optprobe_template_entry)
 #define TMPL_END_IDX		(optprobe_template_end - optprobe_template_entry)
 
-static bool insn_page_in_use;
+#define OPTINSN_SLOT_PAGES (KPROBE_OPTINSN_SLOT_SIZE / PAGE_SIZE)
+
+static bool insn_page_in_use[OPTINSN_SLOT_PAGES];
 
 void *alloc_optinsn_page(void)
 {
-	if (insn_page_in_use)
-		return NULL;
-	insn_page_in_use = true;
-	return &optinsn_slot;
+	int i;
+
+	for (i = 0; i < OPTINSN_SLOT_PAGES; i++) {
+		if (!insn_page_in_use[i]) {
+			insn_page_in_use[i] = true;
+			return (void *)((unsigned long)&optinsn_slot + PAGE_SIZE * i);
+		}
+	}
+	return NULL;
 }
 
 void free_optinsn_page(void *page)
 {
-	insn_page_in_use = false;
+	unsigned long idx = (unsigned long)page - (unsigned long)&optinsn_slot;
+
+	WARN_ON_ONCE(idx & (PAGE_SIZE - 1));
+	idx >>= PAGE_SHIFT;
+	if (WARN_ON_ONCE(idx >= OPTINSN_SLOT_PAGES))
+		return;
+	insn_page_in_use[idx] = false;
 }
 
 /*
