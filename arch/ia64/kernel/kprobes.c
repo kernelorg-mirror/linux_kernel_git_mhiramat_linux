@@ -322,9 +322,6 @@ static void __kprobes get_kprobe_inst(bundle_t *bundle, uint slot,
 	       	unsigned long *kprobe_inst, uint *major_opcode)
 {
 	unsigned long kprobe_inst_p0, kprobe_inst_p1;
-	unsigned int template;
-
-	template = bundle->quad0.template;
 
 	switch (slot) {
 	  case 0:
