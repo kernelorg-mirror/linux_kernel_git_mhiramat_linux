@@ -48,14 +48,18 @@ fetch_store_strlen(unsigned long addr)
 	return (ret < 0) ? strlen(FAULT_STRING) + 1 : len;
 }
 
-static nokprobe_inline void set_data_loc(int ret, void *dest, void *__dest, void *base, int len)
+static nokprobe_inline int set_data_loc(int ret,
+					void *dest_entry,
+					void *dest_data,
+					void *base, int len)
 {
-	if (ret >= 0) {
-		*(u32 *)dest = make_data_loc(ret, __dest - base);
-	} else {
-		strscpy(__dest, FAULT_STRING, len);
-		ret = strlen(__dest) + 1;
+	if (ret < 0) {
+		strscpy(dest_data, FAULT_STRING, len);
+		ret = strlen(dest_data) + 1;
 	}
+	*(u32 *)dest_entry = make_data_loc(ret, dest_data - base);
+
+	return ret;
 }
 
 /*
@@ -63,22 +67,21 @@ static nokprobe_inline void set_data_loc(int ret, void *dest, void *__dest, void
  * with max length and relative data location.
  */
 static nokprobe_inline int
-fetch_store_string_user(unsigned long addr, void *dest, void *base)
+fetch_store_string_user(unsigned long addr, void *dest_entry, void *base)
 {
 	const void __user *uaddr =  (__force const void __user *)addr;
-	int maxlen = get_loc_len(*(u32 *)dest);
-	void *__dest;
+	int maxlen = get_loc_len(*(u32 *)dest_entry);
+	void *dest_data;
 	long ret;
 
 	if (unlikely(!maxlen))
 		return -ENOMEM;
 
-	__dest = get_loc_data(dest, base);
+	dest_data = get_loc_data(dest_entry, base);
 
-	ret = strncpy_from_user_nofault(__dest, uaddr, maxlen);
-	set_data_loc(ret, dest, __dest, base, maxlen);
+	ret = strncpy_from_user_nofault(dest_data, uaddr, maxlen);
 
-	return ret;
+	return set_data_loc(ret, dest_entry, dest_data, base, maxlen);
 }
 
 /*
@@ -86,30 +89,29 @@ fetch_store_string_user(unsigned long addr, void *dest, void *base)
  * length and relative data location.
  */
 static nokprobe_inline int
-fetch_store_string(unsigned long addr, void *dest, void *base)
+fetch_store_string(unsigned long addr, void *dest_entry, void *base)
 {
-	int maxlen = get_loc_len(*(u32 *)dest);
-	void *__dest;
+	int maxlen = get_loc_len(*(u32 *)dest_entry);
+	void *dest_data;
 	long ret;
 
 #ifdef CONFIG_ARCH_HAS_NON_OVERLAPPING_ADDRESS_SPACE
 	if ((unsigned long)addr < TASK_SIZE)
-		return fetch_store_string_user(addr, dest, base);
+		return fetch_store_string_user(addr, dest_entry, base);
 #endif
 
 	if (unlikely(!maxlen))
 		return -ENOMEM;
 
-	__dest = get_loc_data(dest, base);
+	dest_data = get_loc_data(dest_entry, base);
 
 	/*
 	 * Try to get string again, since the string can be changed while
 	 * probing.
 	 */
-	ret = strncpy_from_kernel_nofault(__dest, (void *)addr, maxlen);
-	set_data_loc(ret, dest, __dest, base, maxlen);
+	ret = strncpy_from_kernel_nofault(dest_data, (void *)addr, maxlen);
 
-	return ret;
+	return set_data_loc(ret, dest_entry, dest_data, base, maxlen);
 }
 
 static nokprobe_inline int
