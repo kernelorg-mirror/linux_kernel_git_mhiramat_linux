@@ -665,6 +665,17 @@ config BLK_DEV_IO_TRACE
 
 	  If unsure, say N.
 
+config MONITOR_EVENTS
+	depends on TRACING
+	bool "Enable monitor probe events"
+	select PROBE_EVENTS
+	select DYNAMIC_EVENTS
+	default Y
+	help
+	 This allows user to monitor procfs/sysfs via ftrace directly.
+	 User can specify monitor target and interval milliseconds, and
+	 which parameter records on ftrace ring buffer as a new event.
+
 config FPROBE_EVENTS
 	depends on FPROBE
 	depends on HAVE_REGS_AND_STACK_ACCESS_API

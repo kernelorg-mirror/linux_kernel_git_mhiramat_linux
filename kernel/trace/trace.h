@@ -171,6 +171,11 @@ struct fexit_trace_entry_head {
 	unsigned long		ret_ip;
 };
 
+struct mprobe_trace_entry_head {
+	struct trace_entry	ent;
+	int			dsrc;
+};
+
 #define TRACE_BUF_SIZE		1024
 
 struct trace_array;

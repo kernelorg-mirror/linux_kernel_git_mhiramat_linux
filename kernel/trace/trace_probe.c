@@ -153,6 +153,11 @@ fail:
 	return NULL;
 }
 
+const struct fetch_type *traceprobe_find_fetch_type(const char *type)
+{
+	return find_fetch_type(type, TPARG_FL_KERNEL);
+}
+
 static struct trace_probe_log trace_probe_log;
 
 void trace_probe_log_init(const char *subsystem, int argc, const char **argv)
@@ -1428,6 +1433,11 @@ static int traceprobe_parse_probe_arg_body(const char *argv, ssize_t *size,
 	parg->comm = kstrdup(arg, GFP_KERNEL);
 	if (!parg->comm) {
 		ret = -ENOMEM;
+		goto out;
+	}
+
+	if (ctx->parse_arg) {
+		ret = ctx->parse_arg(arg, size, parg, ctx);
 		goto out;
 	}
 

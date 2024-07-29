@@ -42,6 +42,7 @@
 #define FIELD_STRING_IP		"__probe_ip"
 #define FIELD_STRING_RETIP	"__probe_ret_ip"
 #define FIELD_STRING_FUNC	"__probe_func"
+#define FIELD_STRING_DATASRC	"__data_source"
 
 #undef DEFINE_FIELD
 #define DEFINE_FIELD(type, item, name, is_signed)			\
@@ -94,6 +95,7 @@ enum fetch_op {
 	FETCH_OP_FOFFS,		/* File offset: .immediate */
 	FETCH_OP_DATA,		/* Allocated data: .data */
 	FETCH_OP_EDATA,		/* Entry data: .offset */
+	FETCH_OP_DADDR,		/* Data Address: */
 	// Stage 2 (dereference) op
 	FETCH_OP_DEREF,		/* Dereference: .offset */
 	FETCH_OP_UDEREF,	/* User-space Dereference: .offset */
@@ -385,8 +387,8 @@ static inline int traceprobe_get_entry_data_size(struct trace_probe *tp)
  * The flags used for parsing trace_probe arguments.
  * TPARG_FL_RETURN, TPARG_FL_FENTRY and TPARG_FL_TEVENT are mutually exclusive.
  * TPARG_FL_KERNEL and TPARG_FL_USER are also mutually exclusive.
- * TPARG_FL_FPROBE and TPARG_FL_TPOINT are optional but it should be with
- * TPARG_FL_KERNEL.
+ * TPARG_FL_FPROBE, TPARG_FL_TPOINT and TPARG_FL_MPROBE are optional but it
+ * should be with TPARG_FL_KERNEL.
  */
 #define TPARG_FL_RETURN BIT(0)
 #define TPARG_FL_KERNEL BIT(1)
@@ -395,6 +397,7 @@ static inline int traceprobe_get_entry_data_size(struct trace_probe *tp)
 #define TPARG_FL_USER   BIT(4)
 #define TPARG_FL_FPROBE BIT(5)
 #define TPARG_FL_TPOINT BIT(6)
+#define TPARG_FL_MPROBE BIT(7)
 #define TPARG_FL_LOC_MASK	GENMASK(4, 0)
 
 static inline bool tparg_is_function_entry(unsigned int flags)
@@ -407,6 +410,11 @@ static inline bool tparg_is_function_return(unsigned int flags)
 	return (flags & TPARG_FL_LOC_MASK) == (TPARG_FL_KERNEL | TPARG_FL_RETURN);
 }
 
+struct traceprobe_parse_context;
+typedef int (*parse_arg_func)(char *argv, ssize_t *size,
+			  struct probe_arg *parg,
+			  struct traceprobe_parse_context *ctx);
+
 struct traceprobe_parse_context {
 	struct trace_event_call *event;
 	/* BTF related parameters */
@@ -418,6 +426,7 @@ struct traceprobe_parse_context {
 	const struct btf_type *last_type;	/* Saved type */
 	u32 last_bitoffs;		/* Saved bitoffs */
 	u32 last_bitsize;		/* Saved bitsize */
+	parse_arg_func	parse_arg;	/* Custom argument perser */
 	struct trace_probe *tp;
 	unsigned int flags;
 	int offset;
@@ -433,6 +442,8 @@ extern int traceprobe_expand_dentry_args(int argc, const char *argv[], char **bu
 
 extern int traceprobe_update_arg(struct probe_arg *arg);
 extern void traceprobe_free_probe_arg(struct probe_arg *arg);
+extern const struct fetch_type *traceprobe_find_fetch_type(const char *type);
+
 
 /*
  * If either traceprobe_parse_probe_arg() or traceprobe_expand_meta_args() is called,
@@ -544,7 +555,10 @@ extern int traceprobe_define_arg_fields(struct trace_event_call *event_call,
 	C(NO_BTF_FIELD,		"This field is not found."),	\
 	C(BAD_BTF_TID,		"Failed to get BTF type info."),\
 	C(BAD_TYPE4STR,		"This type does not fit for string."),\
-	C(NEED_STRING_TYPE,	"$comm and immediate-string only accepts string type"),
+	C(NEED_STRING_TYPE,	"$comm and immediate-string only accepts string type"),\
+	C(BAD_DATASRC,		"This data source is not supported"), \
+	C(BAD_INTERVAL,		"Invalid interval parameter"), \
+	C(BAD_MON_ARG,		"Invalid monitoring parameter"),
 
 #undef C
 #define C(a, b)		TP_ERR_##a
