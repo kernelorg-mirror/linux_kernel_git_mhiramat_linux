@@ -70,7 +70,8 @@ struct btf_anon_stack {
 const struct btf_member *btf_find_struct_member(struct btf *btf,
 						const struct btf_type *type,
 						const char *member_name,
-						u32 *anon_offset)
+						u32 *anon_offset,
+						const struct btf_type **member_type)
 {
 	struct btf_anon_stack *anon_stack;
 	const struct btf_member *member;
@@ -91,17 +92,23 @@ retry:
 	for_each_member(i, type, member) {
 		if (!member->name_off) {
 			/* Anonymous union/struct: push it for later use */
+			u32 m_off = btf_type_kflag(type) ?
+				BTF_MEMBER_BIT_OFFSET(member->offset) :
+				member->offset;
+
 			if (btf_type_skip_modifiers(btf, member->type, &tid) &&
 			    top < BTF_ANON_STACK_MAX) {
 				anon_stack[top].tid = tid;
 				anon_stack[top++].offset =
-					cur_offset + member->offset;
+					cur_offset + m_off;
 			}
 		} else {
 			name = btf_name_by_offset(btf, member->name_off);
 			if (name && !strcmp(member_name, name)) {
 				if (anon_offset)
 					*anon_offset = cur_offset;
+				if (member_type)
+					*member_type = type;
 				goto out;
 			}
 		}
