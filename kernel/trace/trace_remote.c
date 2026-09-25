@@ -32,6 +32,7 @@ struct trace_remote_iterator {
 	struct ring_buffer_iter		*rb_iter;
 	struct ring_buffer_iter		**rb_iters;
 	struct remote_event_hdr		*evt;
+	int				evt_len;
 	int				cpu;
 	int				evt_cpu;
 	loff_t				pos;
@@ -39,7 +40,7 @@ struct trace_remote_iterator {
 };
 
 struct trace_remote {
-	struct trace_remote_callbacks	*cbs;
+	const struct trace_remote_callbacks	*cbs;
 	void				*priv;
 	struct trace_buffer		*trace_buffer;
 	struct trace_buffer_desc	*trace_buffer_desc;
@@ -520,6 +521,7 @@ static bool trace_remote_iter_read_event(struct trace_remote_iterator *iter)
 
 		iter->evt_cpu = cpu;
 		iter->evt = ring_buffer_event_data(rb_evt);
+		iter->evt_len = ring_buffer_event_length(rb_evt);
 		return true;
 	}
 
@@ -541,6 +543,7 @@ static bool trace_remote_iter_read_event(struct trace_remote_iterator *iter)
 		iter->ts = ts;
 		iter->evt_cpu = cpu;
 		iter->evt = ring_buffer_event_data(rb_evt);
+		iter->evt_len = ring_buffer_event_length(rb_evt);
 		iter->lost_events = lost_events;
 	}
 
@@ -568,6 +571,18 @@ static int trace_remote_iter_print_event(struct trace_remote_iterator *iter)
 	struct remote_event *evt;
 	unsigned long usecs_rem;
 	u64 ts = iter->ts;
+	int ret;
+
+	if (iter->remote->cbs->print_event) {
+		ret = iter->remote->cbs->print_event(&iter->seq, iter->evt,
+						     iter->evt_len,
+						     iter->evt_cpu, iter->ts,
+						     iter->lost_events,
+						     iter->remote->priv);
+		if (ret < 0)
+			return ret;
+		return trace_seq_has_overflowed(&iter->seq) ? -EOVERFLOW : 0;
+	}
 
 	if (iter->lost_events)
 		trace_seq_printf(&iter->seq, "CPU:%d [LOST %lu EVENTS]\n",
@@ -902,7 +917,7 @@ static int trace_remote_register_events(const char *remote_name, struct trace_re
  *
  * Return: 0 on success, negative error code on failure.
  */
-int trace_remote_register(const char *name, struct trace_remote_callbacks *cbs, void *priv,
+int trace_remote_register(const char *name, const struct trace_remote_callbacks *cbs, void *priv,
 			  struct remote_event *events, size_t nr_events)
 {
 	struct trace_remote *remote;

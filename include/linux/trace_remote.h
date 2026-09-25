@@ -21,9 +21,15 @@
  *			remote to allow writing.
  * @swap_reader_page:	Called when Tracefs consumes a new page from a
  *			ring-buffer. It is expected from the remote to isolate a
+ *			new reader-page from the @cpu ring-buffer.
  * @reset:		Called on `echo 0 > trace`. It is expected from the
  *			remote to reset all ring-buffer pages.
- *			new reader-page from the @cpu ring-buffer.
+ * @print_event:	Optional callback to format and print an event into the
+ *			trace sequence. If provided, overrides default
+ *			remote_event printing. @len is the length of @evt data.
+ *			Must return 0 on success, or a negative errno on error.
+ *			Overflow of the trace_seq is detected by the caller via
+ *			trace_seq_has_overflowed().
  * @enable_event:	Called on events/event_name/enable. It is expected from
  *			the remote to allow the writing event @id.
  */
@@ -34,10 +40,12 @@ struct trace_remote_callbacks {
 	int	(*enable_tracing)(bool enable, void *priv);
 	int	(*swap_reader_page)(unsigned int cpu, void *priv);
 	int	(*reset)(unsigned int cpu, void *priv);
+	int	(*print_event)(struct trace_seq *s, void *evt, int len, int cpu, u64 ts,
+			       unsigned long lost_events, void *priv);
 	int	(*enable_event)(unsigned short id, bool enable, void *priv);
 };
 
-int trace_remote_register(const char *name, struct trace_remote_callbacks *cbs, void *priv,
+int trace_remote_register(const char *name, const struct trace_remote_callbacks *cbs, void *priv,
 			  struct remote_event *events, size_t nr_events);
 
 int trace_remote_alloc_buffer(struct trace_buffer_desc *desc, size_t desc_size, size_t buffer_size,
