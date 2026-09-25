@@ -56,7 +56,13 @@ struct trace_remote {
 	unsigned int			nr_readers;
 	unsigned int			poll_ms;
 	bool				tracing_on;
+	struct list_head		list;
+	char				name[32];
+	struct work_struct		autoremove_work;
 };
+
+static LIST_HEAD(trace_remotes);
+static DEFINE_MUTEX(trace_remotes_lock);
 
 static bool trace_remote_loaded(struct trace_remote *remote)
 {
@@ -92,6 +98,45 @@ static int trace_remote_load(struct trace_remote *remote)
 	return 0;
 }
 
+static void trace_remote_autoremove_work(struct work_struct *work)
+{
+	struct trace_remote *remote = container_of(work, struct trace_remote, autoremove_work);
+
+	/*
+	 * Re-check under both locks that the remote is still eligible for
+	 * removal.  A concurrent reader could have opened the buffer between
+	 * the schedule_work() call and now.
+	 */
+	mutex_lock(&trace_remotes_lock);
+	mutex_lock(&remote->lock);
+	if (remote->nr_readers || remote->tracing_on || trace_remote_loaded(remote)) {
+		mutex_unlock(&remote->lock);
+		mutex_unlock(&trace_remotes_lock);
+		return;
+	}
+	/*
+	 * Remove from the list while holding trace_remotes_lock so that
+	 * trace_remote_unregister() cannot find this remote anymore.
+	 * Keep the object alive until after tracefs_remove() returns so
+	 * that no VFS path can reach a freed inode->i_private.
+	 */
+	list_del(&remote->list);
+	mutex_unlock(&remote->lock);
+	mutex_unlock(&trace_remotes_lock);
+
+	/*
+	 * tracefs_remove() can sleep and waits for all open file handles
+	 * to be released.  It must be called outside of both locks.
+	 */
+	tracefs_remove(remote->dentry);
+
+	if (remote->cbs->destroy)
+		remote->cbs->destroy(remote->priv);
+
+	kfree(remote->pcpu_reader_locks);
+	kfree(remote);
+}
+
 static void trace_remote_try_unload(struct trace_remote *remote)
 {
 	lockdep_assert_held(&remote->lock);
@@ -110,6 +155,9 @@ static void trace_remote_try_unload(struct trace_remote *remote)
 	ring_buffer_free(remote->trace_buffer);
 	remote->trace_buffer = NULL;
 	remote->cbs->unload_trace_buffer(remote->trace_buffer_desc, remote->priv);
+
+	if (remote->cbs->flags & TRACE_REMOTE_FL_AUTOREMOVE)
+		schedule_work(&remote->autoremove_work);
 }
 
 static int trace_remote_enable_tracing(struct trace_remote *remote)
@@ -120,6 +168,9 @@ static int trace_remote_enable_tracing(struct trace_remote *remote)
 
 	if (remote->tracing_on)
 		return 0;
+
+	if (!remote->cbs->enable_tracing)
+		return -ENODEV;
 
 	ret = trace_remote_load(remote);
 	if (ret)
@@ -144,6 +195,9 @@ static int trace_remote_disable_tracing(struct trace_remote *remote)
 
 	if (!remote->tracing_on)
 		return 0;
+
+	if (WARN_ON(!remote->cbs->enable_tracing))
+		return -ENODEV;
 
 	ret = remote->cbs->enable_tracing(false, remote->priv);
 	if (ret)
@@ -923,10 +977,25 @@ int trace_remote_register(const char *name, const struct trace_remote_callbacks 
 	struct trace_remote *remote;
 	int ret;
 
+	/* Reject names that would be silently truncated */
+	if (strlen(name) >= sizeof(remote->name))
+		return -EINVAL;
+
+	scoped_guard(mutex, &trace_remotes_lock) {
+		struct trace_remote *r;
+
+		list_for_each_entry(r, &trace_remotes, list) {
+			if (strcmp(r->name, name) == 0)
+				return -EEXIST;
+		}
+	}
+
 	remote = kzalloc_obj(*remote);
 	if (!remote)
 		return -ENOMEM;
 
+	strscpy(remote->name, name, sizeof(remote->name));
+	INIT_WORK(&remote->autoremove_work, trace_remote_autoremove_work);
 	remote->cbs = cbs;
 	remote->priv = priv;
 	remote->trace_buffer_size = 7 << 10;
@@ -943,16 +1012,89 @@ int trace_remote_register(const char *name, const struct trace_remote_callbacks 
 	if (ret) {
 		pr_err("Failed to register events for trace remote '%s' (%d)\n",
 		       name, ret);
-		return ret;
+		goto err_remove_tracefs;
 	}
 
 	ret = cbs->init ? cbs->init(remote->dentry, priv) : 0;
-	if (ret)
+	if (ret) {
 		pr_err("Init failed for trace remote '%s' (%d)\n", name, ret);
+		goto err_remove_tracefs;
+	}
 
+	scoped_guard(mutex, &trace_remotes_lock) {
+		list_add(&remote->list, &trace_remotes);
+	}
+
+	return 0;
+
+err_remove_tracefs:
+	tracefs_remove(remote->dentry);
+	kfree(remote);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(trace_remote_register);
+
+/**
+ * trace_remote_unregister() - Unregister a Tracefs remote
+ * @name: Name of the remote to unregister
+ *
+ * Return: 0 on success, -ENOENT if not found, -EBUSY if readers are active.
+ */
+int trace_remote_unregister(const char *name)
+{
+	struct trace_remote *remote = NULL, *r;
+
+	/*
+	 * Find and remove from the list under trace_remotes_lock.  Drop the
+	 * lock before calling cancel_work_sync() to avoid deadlocking with
+	 * trace_remote_autoremove_work() which also acquires trace_remotes_lock.
+	 */
+	mutex_lock(&trace_remotes_lock);
+	list_for_each_entry(r, &trace_remotes, list) {
+		if (strcmp(r->name, name) == 0) {
+			remote = r;
+			break;
+		}
+	}
+	if (!remote) {
+		mutex_unlock(&trace_remotes_lock);
+		return -ENOENT;
+	}
+	list_del(&remote->list);
+	mutex_unlock(&trace_remotes_lock);
+
+	/* Safe to call now that trace_remotes_lock is released */
+	cancel_work_sync(&remote->autoremove_work);
+
+	mutex_lock(&remote->lock);
+	if (remote->nr_readers) {
+		/*
+		 * Put the remote back on the list so existing readers can still
+		 * close normally, then let autoremove finish the job.
+		 */
+		scoped_guard(mutex, &trace_remotes_lock) {
+			list_add(&remote->list, &trace_remotes);
+		}
+		mutex_unlock(&remote->lock);
+		return -EBUSY;
+	}
+	if (trace_remote_loaded(remote)) {
+		ring_buffer_free(remote->trace_buffer);
+		remote->trace_buffer = NULL;
+		remote->cbs->unload_trace_buffer(remote->trace_buffer_desc, remote->priv);
+	}
+	mutex_unlock(&remote->lock);
+
+	tracefs_remove(remote->dentry);
+
+	if (remote->cbs->destroy)
+		remote->cbs->destroy(remote->priv);
+
+	kfree(remote->pcpu_reader_locks);
+	kfree(remote);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(trace_remote_unregister);
 
 /**
  * trace_remote_free_buffer() - Free trace buffer allocated with trace_remote_alloc_buffer()
