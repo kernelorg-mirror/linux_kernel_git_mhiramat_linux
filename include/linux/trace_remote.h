@@ -54,9 +54,23 @@ struct trace_remote_callbacks {
 	int	(*enable_event)(unsigned short id, bool enable, void *priv);
 };
 
+#ifdef CONFIG_TRACE_REMOTE
 int trace_remote_register(const char *name, const struct trace_remote_callbacks *cbs, void *priv,
 			  struct remote_event *events, size_t nr_events);
 int trace_remote_unregister(const char *name);
+#else
+static inline int trace_remote_register(const char *name,
+					const struct trace_remote_callbacks *cbs,
+					void *priv,
+					struct remote_event *events, size_t nr_events)
+{
+	return -ENODEV;
+}
+static inline int trace_remote_unregister(const char *name)
+{
+	return -ENODEV;
+}
+#endif
 
 int trace_remote_alloc_buffer(struct trace_buffer_desc *desc, size_t desc_size, size_t buffer_size,
 			      const struct cpumask *cpumask);

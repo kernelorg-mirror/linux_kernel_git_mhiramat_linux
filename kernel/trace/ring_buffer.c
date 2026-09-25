@@ -37,6 +37,8 @@
 #include <asm/local.h>
 #include <asm/setup.h>
 
+#include <linux/sort.h>
+
 #include "trace.h"
 
 /*
@@ -48,28 +50,6 @@
 #define ABS_TS_MASK	(~TS_MSB)
 
 static void update_pages_handler(struct work_struct *work);
-
-#define RING_BUFFER_META_MAGIC	0xBADFEED
-
-struct ring_buffer_meta {
-	int		magic;
-	int		struct_sizes;
-	unsigned long	total_size;
-	unsigned long	buffers_offset;
-};
-
-struct ring_buffer_cpu_meta {
-	unsigned long	first_buffer;
-	unsigned long	head_buffer;
-	unsigned long	commit_buffer;
-	__u32		subbuf_size;
-	__u32		nr_subbufs;
-#ifdef CONFIG_RING_BUFFER_PERSISTENT_INJECT
-	__u32		nr_invalid;
-	__u32		entry_bytes;
-#endif
-	int		buffers[];
-};
 
 /*
  * The ring buffer header is special. We must manually up keep it.
@@ -1692,55 +1672,58 @@ rb_range_align_subbuf(unsigned long addr, unsigned int subbuf_size, unsigned lon
 	return ALIGN(addr, subbuf_size);
 }
 
-/*
- * Return the ring_buffer_meta for a given @cpu.
- */
-static void *rb_range_meta(struct trace_buffer *buffer, unsigned long nr_pages, int cpu)
+static void *rb_range_meta_from_base(struct ring_buffer_meta *bmeta,
+				     unsigned long nr_subbufs,
+				     unsigned int subbuf_size, int cpu)
 {
-	unsigned int subbuf_size = rb_subbuf_size(buffer);
-	struct ring_buffer_cpu_meta *meta;
-	struct ring_buffer_meta *bmeta;
-	unsigned long ptr, nr_subbufs;
+	unsigned long ptr;
 
-	bmeta = buffer->meta;
 	if (!bmeta)
 		return NULL;
 
 	ptr = (unsigned long)bmeta + bmeta->buffers_offset;
-	meta = (struct ring_buffer_cpu_meta *)ptr;
 
-	/* When nr_pages passed in is zero, the first meta has already been initialized */
-	if (!nr_pages) {
-		nr_subbufs = meta->nr_subbufs;
-	} else {
-		/* Include the reader page */
-		nr_subbufs = nr_pages + 1;
-	}
-
-	/*
-	 * The first chunk may not be subbuffer aligned, where as
-	 * the rest of the chunks are.
-	 */
 	if (cpu) {
 		ptr = rb_range_align_subbuf(ptr, subbuf_size, nr_subbufs);
 		ptr += subbuf_size * nr_subbufs;
 
-		/* We can use multiplication to find chunks greater than 1 */
 		if (cpu > 1) {
 			unsigned long size;
 			unsigned long p;
 
-			/* Save the beginning of this CPU chunk */
 			p = ptr;
 			ptr = rb_range_align_subbuf(ptr, subbuf_size, nr_subbufs);
 			ptr += subbuf_size * nr_subbufs;
 
-			/* Now all chunks after this are the same size */
 			size = ptr - p;
 			ptr += size * (cpu - 2);
 		}
 	}
 	return (void *)ptr;
+}
+
+/*
+ * Return the ring_buffer_meta for a given @cpu.
+ */
+static void *rb_range_meta(struct trace_buffer *buffer, unsigned long nr_pages, int cpu)
+{
+	struct ring_buffer_meta *bmeta = buffer->meta;
+	struct ring_buffer_cpu_meta *meta;
+	unsigned int subbuf_size;
+	unsigned long nr_subbufs;
+
+	if (!bmeta)
+		return NULL;
+
+	subbuf_size = rb_subbuf_size(buffer);
+	if (!nr_pages) {
+		meta = (struct ring_buffer_cpu_meta *)((unsigned long)bmeta + bmeta->buffers_offset);
+		nr_subbufs = meta->nr_subbufs;
+	} else {
+		nr_subbufs = nr_pages + 1;
+	}
+
+	return rb_range_meta_from_base(bmeta, nr_subbufs, subbuf_size, cpu);
 }
 
 /* Return the start of subbufs given the meta pointer */
@@ -2248,6 +2231,188 @@ static void rb_meta_validate_events(struct ring_buffer_per_cpu *cpu_buffer)
 		local_set(&head_page->entries, 0);
 		rb_init_data_page(head_page->page);
 	}
+}
+
+struct subbuf_info {
+	struct buffer_data_page	*dpage;
+	u64			ts;
+	int			events;
+};
+
+static int cmp_subbuf_ts(const void *a, const void *b)
+{
+	const struct subbuf_info *sa = a;
+	const struct subbuf_info *sb = b;
+
+	if (sa->ts < sb->ts)
+		return -1;
+	if (sa->ts > sb->ts)
+		return 1;
+	return 0;
+}
+
+struct trace_buffer_desc *
+ring_buffer_create_persistent_desc(void *vaddr, size_t size,
+				   struct trace_buffer_meta **meta_out,
+				   unsigned int **current_head_out,
+				   unsigned int **pages_read_out,
+				   unsigned int **total_valid_pages_out,
+				   unsigned int **nr_pages_out,
+				   int *nr_cpus_out)
+{
+	struct ring_buffer_meta *bmeta = vaddr;
+	struct ring_buffer_cpu_meta *cmeta;
+	struct trace_buffer_desc *desc;
+	struct ring_buffer_desc *rb_desc;
+	struct trace_buffer_meta *meta;
+	unsigned int *current_head, *pages_read, *total_valid_pages, *nr_pages;
+	struct subbuf_info *subbufs;
+	unsigned int subbuf_size, nr_subbufs;
+	size_t desc_len;
+	int nr_cpus, cpu;
+
+	if (!vaddr || size < sizeof(*bmeta))
+		return ERR_PTR(-EINVAL);
+
+	if (bmeta->magic != RING_BUFFER_META_MAGIC || bmeta->total_size != size)
+		return ERR_PTR(-EINVAL);
+
+	if (bmeta->buffers_offset >= size)
+		return ERR_PTR(-EINVAL);
+
+	cmeta = (struct ring_buffer_cpu_meta *)((unsigned long)bmeta + bmeta->buffers_offset);
+	nr_subbufs = cmeta->nr_subbufs;
+	subbuf_size = cmeta->subbuf_size;
+	if (!nr_subbufs || !subbuf_size)
+		return ERR_PTR(-EINVAL);
+
+	nr_cpus = 0;
+	for (cpu = 0; cpu < nr_cpu_ids; cpu++) {
+		void *meta_ptr = rb_range_meta_from_base(bmeta, nr_subbufs, subbuf_size, cpu);
+
+		if (!meta_ptr || (unsigned long)meta_ptr + sizeof(*cmeta) > (unsigned long)vaddr + size)
+			break;
+		nr_cpus++;
+	}
+
+	if (!nr_cpus)
+		return ERR_PTR(-EINVAL);
+
+	meta = kcalloc(nr_cpus, sizeof(*meta), GFP_KERNEL);
+	current_head = kcalloc(nr_cpus, sizeof(*current_head), GFP_KERNEL);
+	pages_read = kcalloc(nr_cpus, sizeof(*pages_read), GFP_KERNEL);
+	total_valid_pages = kcalloc(nr_cpus, sizeof(*total_valid_pages), GFP_KERNEL);
+	nr_pages = kcalloc(nr_cpus, sizeof(*nr_pages), GFP_KERNEL);
+	subbufs = kmalloc_array(nr_subbufs, sizeof(*subbufs), GFP_KERNEL);
+
+	desc_len = offsetof(struct trace_buffer_desc, __data) +
+		   nr_cpus * struct_size(rb_desc, page_va, nr_subbufs);
+	desc = kzalloc(desc_len, GFP_KERNEL);
+
+	if (!meta || !current_head || !pages_read || !total_valid_pages || !nr_pages || !subbufs || !desc) {
+		kfree(meta);
+		kfree(current_head);
+		kfree(pages_read);
+		kfree(total_valid_pages);
+		kfree(nr_pages);
+		kfree(subbufs);
+		kfree(desc);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	desc->nr_cpus = nr_cpus;
+	desc->struct_len = desc_len;
+	rb_desc = __first_ring_buffer_desc(desc);
+
+	for (cpu = 0; cpu < nr_cpus; cpu++) {
+		unsigned long subbufs_ptr;
+		unsigned int valid_count = 0;
+		unsigned long total_events = 0;
+		unsigned int i;
+
+		cmeta = rb_range_meta_from_base(bmeta, nr_subbufs, subbuf_size, cpu);
+		subbufs_ptr = (unsigned long)rb_subbufs_from_meta(cmeta);
+
+		for (i = 0; i < nr_subbufs; i++) {
+			struct buffer_data_page *dp;
+			unsigned long long ts;
+			u64 delta;
+			long tail;
+			int ret;
+
+			if (cmeta->buffers[i] < 0 || cmeta->buffers[i] >= nr_subbufs)
+				continue;
+
+			dp = (void *)(subbufs_ptr + (unsigned long)cmeta->buffers[i] * subbuf_size);
+			if ((unsigned long)dp + subbuf_size > (unsigned long)vaddr + size)
+				continue;
+
+			tail = rb_data_page_commit(dp) & ~RB_MISSED_MASK;
+			if (tail > 0 && tail <= subbuf_size - BUF_PAGE_HDR_SIZE && dp->time_stamp > 0) {
+				ret = rb_read_data_buffer(dp, tail, cpu, &ts, &delta);
+				if (ret > 0) {
+					subbufs[valid_count].dpage = dp;
+					subbufs[valid_count].ts = dp->time_stamp;
+					subbufs[valid_count].events = ret;
+					total_events += ret;
+					valid_count++;
+				}
+			}
+		}
+
+		if (valid_count > 1)
+			sort(subbufs, valid_count, sizeof(*subbufs), cmp_subbuf_ts, NULL);
+
+		rb_desc->cpu = cpu;
+		rb_desc->nr_page_va = nr_subbufs;
+		rb_desc->meta_va = (unsigned long)&meta[cpu];
+
+		for (i = 0; i < valid_count; i++)
+			rb_desc->page_va[i] = (unsigned long)subbufs[i].dpage;
+
+		for (i = valid_count; i < nr_subbufs; i++)
+			rb_desc->page_va[i] = (unsigned long)(subbufs_ptr + (unsigned long)cmeta->buffers[i] * subbuf_size);
+
+		meta[cpu].subbuf_size = subbuf_size;
+		meta[cpu].nr_subbufs = nr_subbufs;
+		meta[cpu].reader.id = 0;
+		meta[cpu].entries = total_events;
+		meta[cpu].read = 0;
+		meta[cpu].overrun = 0;
+
+		total_valid_pages[cpu] = valid_count;
+		pages_read[cpu] = 0;
+		current_head[cpu] = 1;
+		nr_pages[cpu] = nr_subbufs - 1;
+
+		rb_desc = __next_ring_buffer_desc(rb_desc);
+	}
+
+	kfree(subbufs);
+
+	*meta_out = meta;
+	*current_head_out = current_head;
+	*pages_read_out = pages_read;
+	*total_valid_pages_out = total_valid_pages;
+	*nr_pages_out = nr_pages;
+	*nr_cpus_out = nr_cpus;
+
+	return desc;
+}
+
+void ring_buffer_free_persistent_desc(struct trace_buffer_desc *desc,
+				      struct trace_buffer_meta *meta,
+				      unsigned int *current_head,
+				      unsigned int *pages_read,
+				      unsigned int *total_valid_pages,
+				      unsigned int *nr_pages)
+{
+	kfree(desc);
+	kfree(meta);
+	kfree(current_head);
+	kfree(pages_read);
+	kfree(total_valid_pages);
+	kfree(nr_pages);
 }
 
 static void rb_range_meta_init(struct trace_buffer *buffer, unsigned long nr_pages,

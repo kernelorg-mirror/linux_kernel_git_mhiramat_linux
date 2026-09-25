@@ -8,6 +8,7 @@
 #include <linux/sched.h>
 #include <linux/clocksource.h>
 #include <linux/ring_buffer.h>
+#include <uapi/linux/trace_mmap.h>
 #include <linux/mmiotrace.h>
 #include <linux/tracepoint.h>
 #include <linux/ftrace.h>
@@ -777,6 +778,44 @@ trace_buffer_lock_reserve(struct trace_buffer *buffer,
 			  unsigned int trace_ctx);
 
 int ring_buffer_meta_seq_init(struct file *file, struct trace_buffer *buffer, int cpu);
+
+#define RING_BUFFER_META_MAGIC	0xBADFEED
+
+struct ring_buffer_meta {
+	int		magic;
+	int		struct_sizes;
+	unsigned long	total_size;
+	unsigned long	buffers_offset;
+};
+
+struct ring_buffer_cpu_meta {
+	unsigned long	first_buffer;
+	unsigned long	head_buffer;
+	unsigned long	commit_buffer;
+	__u32		subbuf_size;
+	__u32		nr_subbufs;
+#ifdef CONFIG_RING_BUFFER_PERSISTENT_INJECT
+	__u32		nr_invalid;
+	__u32		entry_bytes;
+#endif
+	int		buffers[];
+};
+
+struct trace_buffer_desc *
+ring_buffer_create_persistent_desc(void *vaddr, size_t size,
+				   struct trace_buffer_meta **meta_out,
+				   unsigned int **current_head_out,
+				   unsigned int **pages_read_out,
+				   unsigned int **total_valid_pages_out,
+				   unsigned int **nr_pages_out,
+				   int *nr_cpus_out);
+
+void ring_buffer_free_persistent_desc(struct trace_buffer_desc *desc,
+				      struct trace_buffer_meta *meta,
+				      unsigned int *current_head,
+				      unsigned int *pages_read,
+				      unsigned int *total_valid_pages,
+				      unsigned int *nr_pages);
 
 struct trace_entry *tracing_get_trace_entry(struct trace_array *tr,
 						struct trace_array_cpu *data);

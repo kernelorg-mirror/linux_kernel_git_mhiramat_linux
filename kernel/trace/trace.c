@@ -52,6 +52,7 @@
 #include <linux/sort.h>
 #include <linux/io.h> /* vmap_page_range() */
 #include <linux/fs_context.h>
+#include <linux/trace_remote.h>
 
 #include <asm/setup.h> /* COMMAND_LINE_SIZE */
 
@@ -598,7 +599,7 @@ static void trace_array_init_autoremove(struct trace_array *tr)
 	INIT_WORK(&tr->autoremove_work, trace_array_autoremove);
 }
 
-static void trace_array_start_autoremove(void)
+static void __maybe_unused trace_array_start_autoremove(void)
 {
 	if (autoremove_wq)
 		return;
@@ -9669,11 +9670,195 @@ ssize_t trace_parse_run_command(struct file *file, const char __user *buffer,
 	return done;
 }
 
-__init static int backup_instance_area(const char *backup,
-				       unsigned long *addr, phys_addr_t *size)
+#ifdef CONFIG_TRACE_REMOTE
+/*
+ * Context for a persistent ring buffer backup remote instance.
+ *
+ * We save the minimum information needed to format previous-boot trace events:
+ *   - text_delta / trace_flags / module_delta for symbol resolution
+ *   - the vmalloc copy of the persistent buffer and its parsed descriptor
+ *   - per-cpu read-cursor state
+ *
+ * An embedded struct trace_array is kept inside ctx with the minimal set
+ * of fields initialized (current_trace, trace_flags, flags, text_delta,
+ * scratch, module_delta) so that event formatters and trace_adjust_address()
+ * can resolve symbols and timestamps safely without crashing.
+ */
+struct persistent_backup_ctx {
+	void				*vaddr;
+	size_t				size;
+	struct trace_scratch		*tscratch;
+	struct trace_array		tr;
+	struct mutex			lock;
+	struct mutex			format_lock;
+	struct trace_iterator		*iter;
+	struct trace_buffer_desc	*desc;
+	struct trace_buffer_meta	*meta;
+	unsigned int			*current_head;
+	unsigned int			*pages_read;
+	unsigned int			*total_valid_pages;
+	unsigned int			*nr_pages;
+	int				nr_cpus;
+};
+
+static struct trace_buffer_desc *
+persistent_backup_load_trace_buffer(unsigned long size, void *priv)
 {
+	struct persistent_backup_ctx *ctx = priv;
+	struct trace_buffer_desc *desc;
+
+	guard(mutex)(&ctx->lock);
+	if (ctx->desc)
+		return ctx->desc;
+
+	desc = ring_buffer_create_persistent_desc(ctx->vaddr, ctx->size,
+						  &ctx->meta,
+						  &ctx->current_head,
+						  &ctx->pages_read,
+						  &ctx->total_valid_pages,
+						  &ctx->nr_pages,
+						  &ctx->nr_cpus);
+	if (IS_ERR(desc))
+		return desc;
+
+	ctx->desc = desc;
+	return desc;
+}
+
+static void persistent_backup_unload_trace_buffer(struct trace_buffer_desc *desc, void *priv)
+{
+	struct persistent_backup_ctx *ctx = priv;
+
+	guard(mutex)(&ctx->lock);
+	if (!ctx->desc)
+		return;
+
+	ring_buffer_free_persistent_desc(ctx->desc, ctx->meta,
+					 ctx->current_head, ctx->pages_read,
+					 ctx->total_valid_pages, ctx->nr_pages);
+	ctx->desc = NULL;
+	ctx->meta = NULL;
+	ctx->current_head = NULL;
+	ctx->pages_read = NULL;
+	ctx->total_valid_pages = NULL;
+	ctx->nr_pages = NULL;
+	ctx->nr_cpus = 0;
+}
+
+static int persistent_backup_swap_reader_page(unsigned int cpu, void *priv)
+{
+	struct persistent_backup_ctx *ctx = priv;
+
+	guard(mutex)(&ctx->lock);
+	if (cpu >= ctx->nr_cpus)
+		return -ENODEV;
+
+	if (ctx->pages_read[cpu] >= ctx->total_valid_pages[cpu])
+		return -EBUSY;
+
+	ctx->meta[cpu].reader.id = ctx->current_head[cpu];
+	ctx->current_head[cpu] = (ctx->current_head[cpu] + 1) % (ctx->nr_pages[cpu] + 1);
+	ctx->pages_read[cpu]++;
+
+	return 0;
+}
+
+static void persistent_backup_destroy(void *priv)
+{
+	struct persistent_backup_ctx *ctx = priv;
+
+	if (!ctx)
+		return;
+
+	if (ctx->desc)
+		ring_buffer_free_persistent_desc(ctx->desc, ctx->meta,
+						 ctx->current_head, ctx->pages_read,
+						 ctx->total_valid_pages, ctx->nr_pages);
+
+	kfree(ctx->tr.module_delta);
+	kfree(ctx->iter);
+	vfree(ctx->vaddr);
+	kfree(ctx);
+}
+
+static int persistent_backup_print_event(struct trace_seq *s, void *evt, int len,
+					 int cpu, u64 ts, unsigned long lost_events,
+					 void *priv)
+{
+	struct persistent_backup_ctx *ctx = priv;
+	struct trace_entry *entry = evt;
+	struct trace_event *trace_event;
+	struct trace_iterator *iter;
+	unsigned long usecs_rem;
+	u64 t = ts;
+
+	if (lost_events)
+		trace_seq_printf(s, "CPU:%d [LOST %lu EVENTS]\n", cpu, lost_events);
+
+	do_div(t, 1000);
+	usecs_rem = do_div(t, USEC_PER_SEC);
+	trace_seq_printf(s, "[%03d] %5llu.%06lu: ", cpu, t, usecs_rem);
+
+	/*
+	 * We hold trace_event_sem across the whole formatting window so that
+	 * the event format (funcs pointer and field list) cannot be freed by
+	 * a concurrent module unload.  This covers both the fields path and
+	 * the fast funcs->trace() path.
+	 */
+	down_read(&trace_event_sem);
+
+	trace_event = ftrace_find_event(entry->type);
+	if (!trace_event) {
+		up_read(&trace_event_sem);
+		trace_seq_printf(s, "Unknown type %d\n", entry->type);
+		return 0;
+	}
+
+	scoped_guard(mutex, &ctx->format_lock) {
+		iter = ctx->iter;
+		memset(iter, 0, sizeof(*iter));
+		iter->tr = &ctx->tr;
+		iter->cpu = cpu;
+		iter->ts = ts;
+		iter->ent = entry;
+		iter->ent_size = len;
+		trace_seq_init(&iter->seq);
+
+		if (ctx->tr.text_delta &&
+		    (trace_event->type > __TRACE_LAST_TYPE) &&
+		    !is_syscall_event(trace_event)) {
+			/* TRACE_EVENT() with KASLR delta: use field-by-field path */
+			print_event_fields(iter, trace_event);
+		} else {
+			trace_event->funcs->trace(iter,
+						  ctx->tr.trace_flags & TRACE_ITER_SYM_MASK,
+						  trace_event);
+		}
+
+		trace_seq_puts(s, iter->seq.buffer);
+	}
+
+	up_read(&trace_event_sem);
+	return 0;
+}
+
+static const struct trace_remote_callbacks persistent_backup_cbs = {
+	.flags			= TRACE_REMOTE_FL_AUTOREMOVE,
+	.destroy		= persistent_backup_destroy,
+	.load_trace_buffer	= persistent_backup_load_trace_buffer,
+	.unload_trace_buffer	= persistent_backup_unload_trace_buffer,
+	.swap_reader_page	= persistent_backup_swap_reader_page,
+	.print_event		= persistent_backup_print_event,
+};
+
+__init static int backup_instance_remote(const char *name, const char *backup)
+{
+	struct persistent_backup_ctx *ctx;
 	struct trace_array *backup_tr;
-	void *allocated_vaddr = NULL;
+	struct ring_buffer_meta *bmeta;
+	phys_addr_t size = 0;
+	void *vaddr = NULL;
+	int ret;
 
 	backup_tr = trace_array_get_by_name(backup, NULL);
 	if (!backup_tr) {
@@ -9687,23 +9872,101 @@ __init static int backup_instance_area(const char *backup,
 		return -EINVAL;
 	}
 
-	*size = backup_tr->range_addr_size;
-
-	allocated_vaddr = vzalloc(*size);
-	if (!allocated_vaddr) {
+	size = backup_tr->range_addr_size;
+	vaddr = vzalloc(size);
+	if (!vaddr) {
 		pr_warn("Tracing: Failed to allocate memory for copying instance %s (size 0x%lx)\n",
-			backup, (unsigned long)*size);
+			backup, (unsigned long)size);
 		trace_array_put(backup_tr);
 		return -ENOMEM;
 	}
 
-	memcpy(allocated_vaddr,
-		(void *)backup_tr->range_addr_start, (size_t)*size);
-	*addr = (unsigned long)allocated_vaddr;
+	memcpy(vaddr, (void *)backup_tr->range_addr_start, (size_t)size);
 
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx) {
+		vfree(vaddr);
+		trace_array_put(backup_tr);
+		return -ENOMEM;
+	}
+
+	ctx->iter = kzalloc(sizeof(*ctx->iter), GFP_KERNEL);
+	if (!ctx->iter) {
+		kfree(ctx);
+		vfree(vaddr);
+		trace_array_put(backup_tr);
+		return -ENOMEM;
+	}
+
+	mutex_init(&ctx->lock);
+	mutex_init(&ctx->format_lock);
+	ctx->vaddr = vaddr;
+	ctx->size = size;
+
+	/*
+	 * Initialize the minimal trace_array fields needed by event formatters:
+	 *  - current_trace: non-NULL to satisfy tracer_uses_snapshot() etc.
+	 *  - trace_flags: inherits flags like TRACE_ITER(HASH_PTR)
+	 *  - flags: mark as BOOT and LAST_BOOT so trace_adjust_address() knows
+	 *    to apply text and module deltas from previous boot
+	 *  - text_delta: KASLR offset between previous boot and current boot
+	 *  - scratch: points to scratch area in persistent memory
+	 *  - module_delta: duplicate of module deltas from previous boot
+	 */
+	ctx->tr.current_trace = &nop_trace;
+	ctx->tr.trace_flags = backup_tr->trace_flags;
+	ctx->tr.flags = TRACE_ARRAY_FL_BOOT | TRACE_ARRAY_FL_LAST_BOOT;
+	ctx->tr.text_delta = backup_tr->text_delta;
+
+	bmeta = vaddr;
+	if (bmeta->magic == RING_BUFFER_META_MAGIC &&
+	    bmeta->buffers_offset > sizeof(*bmeta)) {
+		unsigned long s_offset = ALIGN(sizeof(*bmeta), sizeof(long));
+
+		if (bmeta->buffers_offset > s_offset) {
+			ctx->tscratch = (void *)vaddr + s_offset;
+			ctx->tr.scratch = ctx->tscratch;
+			ctx->tr.scratch_size = bmeta->buffers_offset - s_offset;
+		}
+	}
+
+	if (backup_tr->module_delta && ctx->tscratch && ctx->tscratch->nr_entries) {
+		size_t dsize = struct_size(backup_tr->module_delta, delta, ctx->tscratch->nr_entries);
+
+		ctx->tr.module_delta = kmemdup(backup_tr->module_delta, dsize, GFP_KERNEL);
+		if (!ctx->tr.module_delta) {
+			ret = -ENOMEM;
+			goto err_free_iter;
+		}
+	}
+
+	ret = trace_remote_register(name, &persistent_backup_cbs, ctx, NULL, 0);
+	if (ret) {
+		pr_warn("Tracing: Failed to register remote backup instance %s (%d)\n",
+			name, ret);
+		goto err_free_iter;
+	}
+
+	pr_info("Tracing: Registered persistent backup instance %s as remote\n", name);
 	trace_array_put(backup_tr);
 	return 0;
+
+err_free_iter:
+	kfree(ctx->tr.module_delta);
+	kfree(ctx->iter);
+	kfree(ctx);
+	vfree(vaddr);
+	trace_array_put(backup_tr);
+	return ret;
 }
+#else /* !CONFIG_TRACE_REMOTE */
+__init static inline int backup_instance_remote(const char *name, const char *backup)
+{
+	pr_warn("Tracing: Cannot create backup %s: CONFIG_TRACE_REMOTE is disabled\n",
+		name);
+	return -ENODEV;
+}
+#endif /* CONFIG_TRACE_REMOTE */
 
 __init static void enable_instances(void)
 {
@@ -9749,8 +10012,8 @@ __init static void enable_instances(void)
 		}
 
 		if (backup) {
-			if (backup_instance_area(backup, &addr, &size) < 0)
-				continue;
+			backup_instance_remote(name, backup);
+			continue;
 		}
 
 		if (flag_delim) {
@@ -9847,15 +10110,7 @@ __init static void enable_instances(void)
 			tr->ref++;
 		}
 
-		/*
-		 * Backup buffers can be freed but need vfree().
-		 */
-		if (backup) {
-			tr->flags |= TRACE_ARRAY_FL_VMALLOC | TRACE_ARRAY_FL_RDONLY;
-			trace_array_start_autoremove();
-		}
-
-		if (start || backup) {
+		if (start) {
 			tr->flags |= TRACE_ARRAY_FL_BOOT | TRACE_ARRAY_FL_LAST_BOOT;
 			tr->range_name = no_free_ptr(rname);
 		}
