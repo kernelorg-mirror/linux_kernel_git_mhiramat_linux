@@ -1430,9 +1430,6 @@ static int __ftrace_set_clr_event(struct trace_array *tr, const char *match,
 {
 	int ret;
 
-	if (trace_array_is_readonly(tr))
-		return -EACCES;
-
 	mutex_lock(&event_mutex);
 	ret = __ftrace_set_clr_event_nolock(tr, match, sub, event, set, mod);
 	mutex_unlock(&event_mutex);
@@ -3085,8 +3082,8 @@ event_subsystem_dir(struct trace_array *tr, const char *name,
 	} else
 		__get_system(system);
 
-	/* ftrace only has directories no files, readonly instance too. */
-	if (strcmp(name, "ftrace") == 0 || trace_array_is_readonly(tr))
+	/* ftrace only has directories no files */
+	if (strcmp(name, "ftrace") == 0)
 		nr_entries = 0;
 	else
 		nr_entries = ARRAY_SIZE(system_entries);
@@ -3255,7 +3252,6 @@ event_create_dir(struct eventfs_inode *parent, struct trace_event_file *file)
 	struct eventfs_inode *e_events;
 	struct eventfs_inode *ei;
 	const char *name;
-	int nr_entries;
 	int ret;
 	static struct eventfs_entry event_entries[] = {
 		{
@@ -3274,9 +3270,6 @@ event_create_dir(struct eventfs_inode *parent, struct trace_event_file *file)
 			.callback	= event_callback,
 		},
 #endif
-#define NR_RO_EVENT_ENTRIES	(1 + IS_ENABLED(CONFIG_PERF_EVENTS) + \
-				 IS_ENABLED(CONFIG_BPF_EVENTS))
-/* Readonly files must be above this line and counted by NR_RO_EVENT_ENTRIES. */
 		{
 			.name		= "enable",
 			.callback	= event_callback,
@@ -3329,13 +3322,8 @@ event_create_dir(struct eventfs_inode *parent, struct trace_event_file *file)
 	if (!e_events)
 		return -ENOMEM;
 
-	if (trace_array_is_readonly(tr))
-		nr_entries = NR_RO_EVENT_ENTRIES;
-	else
-		nr_entries = ARRAY_SIZE(event_entries);
-
 	name = trace_event_name(call);
-	ei = eventfs_create_dir(name, e_events, event_entries, nr_entries, file);
+	ei = eventfs_create_dir(name, e_events, event_entries, ARRAY_SIZE(event_entries), file);
 	if (IS_ERR(ei)) {
 		pr_warn("Could not create tracefs '%s' directory\n", name);
 		return -1;
@@ -4686,7 +4674,6 @@ create_event_toplevel_files(struct dentry *parent, struct trace_array *tr)
 {
 	struct eventfs_inode *e_events;
 	struct dentry *entry;
-	int nr_entries;
 	static struct eventfs_entry events_entries[] = {
 		{
 			.name		= "header_page",
@@ -4696,40 +4683,33 @@ create_event_toplevel_files(struct dentry *parent, struct trace_array *tr)
 			.name		= "header_event",
 			.callback	= events_callback,
 		},
-#define NR_RO_TOP_ENTRIES	2
-/* Readonly files must be above this line and counted by NR_RO_TOP_ENTRIES. */
 		{
 			.name		= "enable",
 			.callback	= events_callback,
 		},
 	};
 
-	if (!trace_array_is_readonly(tr)) {
-		entry = trace_create_file("set_event", TRACE_MODE_WRITE, parent,
-					tr, &ftrace_set_event_fops);
-		if (!entry)
-			return -ENOMEM;
+	entry = trace_create_file("set_event", TRACE_MODE_WRITE, parent,
+				  tr, &ftrace_set_event_fops);
+	if (!entry)
+		return -ENOMEM;
 
-		/* There are not as crucial, just warn if they are not created */
-		trace_create_file("show_event_filters", TRACE_MODE_READ, parent, tr,
-				&ftrace_show_event_filters_fops);
+	/* There are not as crucial, just warn if they are not created */
+	trace_create_file("show_event_filters", TRACE_MODE_READ, parent, tr,
+			  &ftrace_show_event_filters_fops);
 
-		trace_create_file("show_event_triggers", TRACE_MODE_READ, parent, tr,
-				&ftrace_show_event_triggers_fops);
+	trace_create_file("show_event_triggers", TRACE_MODE_READ, parent, tr,
+			  &ftrace_show_event_triggers_fops);
 
-		trace_create_file("set_event_pid", TRACE_MODE_WRITE, parent,
-				tr, &ftrace_set_event_pid_fops);
+	trace_create_file("set_event_pid", TRACE_MODE_WRITE, parent,
+			  tr, &ftrace_set_event_pid_fops);
 
-		trace_create_file("set_event_notrace_pid",
-				TRACE_MODE_WRITE, parent, tr,
-				&ftrace_set_event_notrace_pid_fops);
-		nr_entries = ARRAY_SIZE(events_entries);
-	} else {
-		nr_entries = NR_RO_TOP_ENTRIES;
-	}
+	trace_create_file("set_event_notrace_pid",
+			  TRACE_MODE_WRITE, parent, tr,
+			  &ftrace_set_event_notrace_pid_fops);
 
 	e_events = eventfs_create_events_dir("events", parent, events_entries,
-					     nr_entries, tr);
+					     ARRAY_SIZE(events_entries), tr);
 	if (IS_ERR(e_events)) {
 		pr_warn("Could not create tracefs 'events' directory\n");
 		return -ENOMEM;
