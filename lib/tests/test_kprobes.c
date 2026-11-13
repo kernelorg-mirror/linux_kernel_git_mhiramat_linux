@@ -358,7 +358,135 @@ static void test_stacktrace_on_nested_kretprobe(struct kunit *test)
 }
 #endif /* CONFIG_ARCH_CORRECT_STACKTRACE_ON_KRETPROBE */
 
+/* Test for: kprobes: Fix double free and NULL deref in unregister_kretprobes() */
+static void test_kretprobe_unregistered_cleanup(struct kunit *test)
+{
+	struct kretprobe unreg_rp = {
+		.kp.symbol_name = "kprobe_target",
+	};
+
+	current_test = test;
+
+	/* Unregistering a probe that was never registered must return cleanly */
+	unregister_kretprobe(&unreg_rp);
+
+	/* Double unregister of a valid registered probe */
+	KUNIT_ASSERT_EQ(test, 0, register_kretprobe(&unreg_rp));
+	unregister_kretprobe(&unreg_rp);
+	/* Second unregister must not cause double-free or NULL pointer dereference */
+	unregister_kretprobe(&unreg_rp);
+}
+
+/* Test for: kprobes: Validate re-registration earlier in register_kretprobe() */
+static void test_kretprobe_rereg_by_symbol(struct kunit *test)
+{
+	struct kretprobe test_rp = {
+		.kp.symbol_name = "kprobe_target",
+		.handler = return_handler,
+		.entry_handler = entry_handler,
+	};
+
+	current_test = test;
+	KUNIT_ASSERT_EQ(test, 0, register_kretprobe(&test_rp));
+
+	/* Verify the probe is live and functional */
+	krph_val = 0;
+	target(rand1);
+	KUNIT_EXPECT_EQ(test, krph_val, rand1);
+
+	/*
+	 * Attempt re-registration with symbol_name (with kp.addr cleared).
+	 * Must fail with -EINVAL and NOT destroy the live probe's rethook.
+	 */
+	test_rp.kp.addr = NULL;
+	KUNIT_EXPECT_EQ(test, -EINVAL, register_kretprobe(&test_rp));
+
+	/* The original kretprobe must still be functional */
+	krph_val = 0;
+	target(rand1);
+	KUNIT_EXPECT_EQ(test, krph_val, rand1);
+
+	unregister_kretprobe(&test_rp);
+}
+
 #endif /* CONFIG_KRETPROBES */
+
+#if defined(CONFIG_KPROBES_ON_FTRACE)
+/* Test for: kprobes: Switch ftrace ops when adding probe with post_handler */
+static void test_kprobe_ftrace_post_handler_switch(struct kunit *test)
+{
+	struct kprobe kp_entry = {
+		.symbol_name = "kprobe_target",
+		.pre_handler = kp_pre_handler,
+	};
+	struct kprobe kp_post = {
+		.symbol_name = "kprobe_target",
+		.post_handler = kp_post_handler,
+	};
+	int ret;
+
+	current_test = test;
+
+	/* 1. Register first probe without post_handler (armed with kprobe_ftrace_ops) */
+	KUNIT_ASSERT_EQ(test, 0, register_kprobe(&kp_entry));
+
+	/* 2. Register second probe with post_handler at same IP (must switch ops) */
+	ret = register_kprobe(&kp_post);
+	KUNIT_EXPECT_EQ(test, 0, ret);
+	if (!ret) {
+		/* 3. Execute target function to trigger both */
+		preh_val = 0;
+		posth_val = 0;
+		target(rand1);
+		KUNIT_EXPECT_NE(test, 0, preh_val);
+		KUNIT_EXPECT_NE(test, 0, posth_val);
+
+		/* 4. Unregistering must successfully disarm without -ENOENT */
+		unregister_kprobe(&kp_post);
+	}
+	unregister_kprobe(&kp_entry);
+}
+#endif
+
+#if defined(CONFIG_OPTPROBES) && !IS_MODULE(CONFIG_KPROBES_SANITY_TEST)
+static u32 (*opt_target)(u32 value);
+
+static noinline notrace u32 kprobe_opt_target(u32 value)
+{
+	return (value / div_factor) + 2;
+}
+
+/* Test for: kprobes: Do not overwrite jump instruction when re-arming unoptimizing probe */
+static void test_optprobe_rearm_unoptimizing(struct kunit *test)
+{
+	struct kprobe opt_kp = {
+		.symbol_name = "kprobe_opt_target",
+		.pre_handler = kp_pre_handler,
+	};
+	kprobe_opcode_t jmp_op;
+
+	current_test = test;
+	KUNIT_ASSERT_EQ(test, 0, register_kprobe(&opt_kp));
+
+	/* Allow background optimizer thread to jump-optimize the probe */
+	wait_for_kprobe_optimizer();
+	jmp_op = READ_ONCE(*opt_kp.addr);
+
+	/* Temporarily disable probe (queues on unoptimizing_list, leaves jump) */
+	KUNIT_EXPECT_EQ(test, 0, disable_kprobe(&opt_kp));
+
+	/* Immediately re-enable (re-arm) before optimizer thread unoptimizes */
+	KUNIT_EXPECT_EQ(test, 0, enable_kprobe(&opt_kp));
+
+	/* Verify jump opcode was not overwritten by a breakpoint on re-arm */
+	KUNIT_EXPECT_EQ(test, jmp_op, READ_ONCE(*opt_kp.addr));
+	preh_val = 0;
+	opt_target(rand1);
+	KUNIT_EXPECT_NE(test, 0, preh_val);
+
+	unregister_kprobe(&opt_kp);
+}
+#endif
 
 static int kprobes_test_init(struct kunit *test)
 {
@@ -380,6 +508,9 @@ static int kprobes_test_init(struct kunit *test)
 	stacktrace_target = kprobe_stacktrace_target;
 	internal_target = kprobe_stacktrace_internal_target;
 	stacktrace_driver = kprobe_stacktrace_driver;
+#if defined(CONFIG_OPTPROBES) && !IS_MODULE(CONFIG_KPROBES_SANITY_TEST)
+	opt_target = kprobe_opt_target;
+#endif
 	rand1 = get_random_u32_above(div_factor);
 	return 0;
 }
@@ -391,10 +522,18 @@ static struct kunit_case kprobes_testcases[] = {
 #ifdef CONFIG_KRETPROBES
 	KUNIT_CASE(test_kretprobe),
 	KUNIT_CASE(test_kretprobes),
+	KUNIT_CASE(test_kretprobe_unregistered_cleanup),
+	KUNIT_CASE(test_kretprobe_rereg_by_symbol),
 #ifdef CONFIG_ARCH_CORRECT_STACKTRACE_ON_KRETPROBE
 	KUNIT_CASE(test_stacktrace_on_kretprobe),
 	KUNIT_CASE(test_stacktrace_on_nested_kretprobe),
 #endif
+#endif
+#if defined(CONFIG_KPROBES_ON_FTRACE)
+	KUNIT_CASE(test_kprobe_ftrace_post_handler_switch),
+#endif
+#if defined(CONFIG_OPTPROBES) && !IS_MODULE(CONFIG_KPROBES_SANITY_TEST)
+	KUNIT_CASE(test_optprobe_rearm_unoptimizing),
 #endif
 	{}
 };
