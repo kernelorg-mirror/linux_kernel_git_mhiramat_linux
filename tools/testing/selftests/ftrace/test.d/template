@@ -5,6 +5,7 @@
 # The required tracer needs :tracer suffix, e.g. function:tracer
 # The required README string needs :README suffix, e.g. "x8/16/32/64":README
 # and the README string is treated as a fixed-string instead of regexp pattern.
+# The required debugfs interface needs :debugfs suffix, e.g. kprobes/list:debugfs
 # you have to add ".tc" extention for your testcase file
 # Note that all tests are run with "errexit" option.
 

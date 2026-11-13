@@ -145,6 +145,7 @@ check_requires() { # Check required files and tracers
 	p=${i%:program}
         r=${i%:README}
         t=${i%:tracer}
+	d=${i%:debugfs}
 	if [ "$p" != "$i" ]; then
 	    if ! which "$p" ; then
                 echo "Required program $p is not found."
@@ -166,6 +167,15 @@ check_requires() { # Check required files and tracers
                 echo "Required feature pattern \"$r\" is not in README."
                 exit_unsupported
             fi
+	elif [ "$d" != "$i" ]; then
+	    DEBUGFS_DIR=$(awk '$3 == "debugfs" { print $2; exit }' /proc/mounts)
+	    if [ -z "$DEBUGFS_DIR" ]; then
+		echo "Required filesystem debugfs is not mounted."
+		exit_unsupported
+	    elif [ ! -e "$DEBUGFS_DIR/$d" ]; then
+		echo "Required debugfs interface $d doesn't exist."
+		exit_unsupported
+	    fi
         elif [ ! -e "$i" ]; then
             echo "Required feature interface $i doesn't exist."
             exit_unsupported
