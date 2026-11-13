@@ -917,7 +917,7 @@ static int __trace_eprobe_create(int argc, const char *argv[])
 		trace_probe_log_set_index(filter_idx);
 		ret = trace_eprobe_parse_filter(ep, filter_cnt, argv + filter_idx);
 		if (ret)
-			return -EINVAL;
+			return ret;
 	} else
 		ep->filter_str = NULL;
 

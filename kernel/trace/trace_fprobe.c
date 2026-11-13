@@ -1272,7 +1272,7 @@ static int trace_fprobe_create_internal(int argc, const char *argv[],
 	/* a symbol(or tracepoint) must be specified */
 	ret = parse_symbol_and_return(argc, argv, &symbol, &is_return, is_tracepoint);
 	if (ret < 0)
-		return -EINVAL;
+		return ret;
 
 	trace_probe_log_set_index(0);
 	if (event) {
@@ -1388,7 +1388,7 @@ static int trace_fprobe_create_internal(int argc, const char *argv[],
 			trace_probe_log_err(0, BAD_PROBE_ADDR);
 		else if (ret != -ENOMEM && ret != -EEXIST)
 			trace_probe_log_err(0, FAIL_REG_PROBE);
-		return -EINVAL;
+		return ret;
 	}
 
 	/* 'tf' is successfully registered. To avoid freeing, assign NULL. */
