@@ -1962,7 +1962,8 @@ static int finalize_fetch_insn(struct fetch_insn *code,
 		if (!strcmp(parg->type->name, "symstr")) {
 			if (code->op != FETCH_OP_REG && code->op != FETCH_OP_STACK &&
 			    code->op != FETCH_OP_RETVAL && code->op != FETCH_OP_ARG &&
-			    code->op != FETCH_OP_DEREF && code->op != FETCH_OP_TP_ARG) {
+			    code->op != FETCH_OP_DEREF && code->op != FETCH_OP_TP_ARG &&
+			    code->op != FETCH_OP_EDATA) {
 				trace_probe_log_err(ctx->offset + type_offset,
 						    BAD_SYMSTRING);
 				return -EINVAL;
