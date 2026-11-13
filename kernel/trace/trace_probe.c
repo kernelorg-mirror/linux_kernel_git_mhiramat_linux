@@ -2438,11 +2438,17 @@ int traceprobe_expand_dentry_args(int argc, const char *argv[], char **buf)
 		if (!tmp)
 			return -ENOMEM;
 
+		arg_len = strlen(argv[i]);
+		tmp[arg_len - 4] = '\0';
 		equal = strchr(tmp, '=');
 		if (equal)
 			*equal = '\0';
-		arg_len = strlen(argv[i]);
-		tmp[arg_len - 4] = '\0';
+		if (*(equal ? equal + 1 : tmp) == '\0') {
+			trace_probe_log_set_index(i + 2);
+			trace_probe_log_err(equal ? equal + 1 - tmp : 0,
+					    BAD_FETCH_ARG);
+			return -EINVAL;
+		}
 		if (argv[i][arg_len - 1] == 'd')
 			ret = snprintf(tmpbuf + used, bufsize - used,
 				       "%s%s+0x0(+0x%zx(%s)):string",
