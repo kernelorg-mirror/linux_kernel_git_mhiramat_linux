@@ -846,12 +846,18 @@ static int __trace_eprobe_create(int argc, const char *argv[])
 
 	trlog = trace_probe_log_init("event_probe", argc, argv);
 
-	event = strchr(&argv[0][1], ':');
+	if (argv[0][1] != '\0') {
+		if (argv[0][1] != ':') {
+			trace_probe_log_set_index(0);
+			trace_probe_log_err(1, BAD_MAXACT);
+			return -EINVAL;
+		}
+		event = &argv[0][2];
+	}
 	if (event) {
 		gbuf = kmalloc(MAX_EVENT_NAME_LEN, GFP_KERNEL);
 		if (!gbuf)
 			return -ENOMEM;
-		event++;
 		ret = traceprobe_parse_event_name(&event, &group, gbuf,
 						  event - argv[0]);
 		if (ret)

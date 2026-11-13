@@ -941,6 +941,9 @@ static int trace_kprobe_create_internal(int argc, const char *argv[],
 			trace_probe_log_err(1, MAXACT_TOO_BIG);
 			return -EINVAL;
 		}
+	} else if (argv[0][1] != '\0' && argv[0][1] != ':') {
+		trace_probe_log_err(1, BAD_MAXACT);
+		return -EINVAL;
 	}
 
 	/* try to parse an address. if that fails, try to read the

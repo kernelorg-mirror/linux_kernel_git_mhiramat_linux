@@ -616,9 +616,6 @@ static int __trace_uprobe_create(int argc, const char **argv)
 		return -E2BIG;
 	}
 
-	if (argv[0][1] == ':')
-		event = &argv[0][2];
-
 	if (!strchr(argv[1], '/'))
 		return -ECANCELED;
 
@@ -630,6 +627,15 @@ static int __trace_uprobe_create(int argc, const char **argv)
 	arg = strrchr(filename, ':');
 	if (!arg || !isdigit(arg[1]))
 		return -ECANCELED;
+
+	if (argv[0][1] != '\0') {
+		if (argv[0][1] != ':') {
+			trace_probe_log_set_index(0);
+			trace_probe_log_err(1, BAD_MAXACT);
+			return -EINVAL;
+		}
+		event = &argv[0][2];
+	}
 
 	trace_probe_log_set_index(1);	/* filename is the 2nd argument */
 
