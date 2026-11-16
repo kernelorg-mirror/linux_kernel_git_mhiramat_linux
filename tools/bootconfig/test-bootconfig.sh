@@ -233,6 +233,121 @@ for i in samples/good-* ; do
   xpass diff $x $TEMPCONF
 done
 
+echo "=== multiple bootconfig tests ==="
+dd if=/dev/zero of=$INITRD bs=4097 count=1 2>/dev/null
+orig_size=$(wc -c < $INITRD)
+
+printf 'kernel.root = /dev/sda1\nfoo = a\n' > $TEMPCONF
+echo "ID validation tests"
+xfail $BOOTCONF -i "0bad" -a $TEMPCONF $INITRD
+xfail $BOOTCONF -i "9" -a $TEMPCONF $INITRD
+xfail $BOOTCONF -i "a,b" -a $TEMPCONF $INITRD
+xfail $BOOTCONF -i "+a" -a $TEMPCONF $INITRD
+xfail $BOOTCONF -i "bad id" -a $TEMPCONF $INITRD
+xfail $BOOTCONF -i "12345678901234567890123456789012" -a $TEMPCONF $INITRD
+xfail $BOOTCONF -i "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" -a $TEMPCONF $INITRD
+xpass $BOOTCONF -i "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" -a $TEMPCONF $INITRD
+xpass $BOOTCONF -d $INITRD
+xpass test $orig_size -eq $(wc -c < $INITRD)
+
+echo "Apply named and default bootconfigs"
+printf 'kernel.loglevel = 5\nfoo = base\nbar = one\n' > $TEMPCONF
+xpass $BOOTCONF -i _alpha -a $TEMPCONF $INITRD
+printf 'kernel.loglevel := 7\nfoo := debug\nbar += two\n' > $TEMPCONF
+xpass $BOOTCONF -i beta-1.0 -a $TEMPCONF $INITRD
+printf 'kernel.quiet\nfoo = def\nbar = zero\n' > $TEMPCONF
+xpass $BOOTCONF -a $TEMPCONF $INITRD
+
+$BOOTCONF $INITRD > $OUTFILE
+xpass grep -q '\[0\][[:space:]](default)' $OUTFILE
+xpass grep -q '\[1\][[:space:]]#BOOTCONFIG-ID:[[:space:]]_alpha' $OUTFILE
+xpass grep -q '\[2\][[:space:]]#BOOTCONFIG-ID:[[:space:]]beta-1.0' $OUTFILE
+
+echo "Replace existing named bootconfig in place"
+printf 'kernel.loglevel = 4\nfoo = alpha_v2\nbar = one\n' > $TEMPCONF
+xpass $BOOTCONF -i _alpha -a $TEMPCONF $INITRD
+$BOOTCONF $INITRD > $OUTFILE
+xpass grep -q 'alpha_v2' $OUTFILE
+xpass grep -q '\[1\][[:space:]]#BOOTCONFIG-ID:[[:space:]]_alpha' $OUTFILE
+xpass grep -q '\[2\][[:space:]]#BOOTCONFIG-ID:[[:space:]]beta-1.0' $OUTFILE
+
+echo "Select and merge by ID, index, and +append"
+$BOOTCONF -l -i _alpha,beta-1.0 $INITRD > $OUTFILE
+xpass grep -q 'foo[[:space:]]=[[:space:]]"debug"' $OUTFILE
+xpass grep -q 'bar[[:space:]]=[[:space:]]"one",[[:space:]]"two"' $OUTFILE
+xpass grep -q 'kernel.loglevel[[:space:]]=[[:space:]]"7"' $OUTFILE
+
+$BOOTCONF -l -i 1,2 $INITRD > $TEMPCONF
+xpass cmp $OUTFILE $TEMPCONF
+
+$BOOTCONF -C -i _alpha,beta-1.0 $INITRD > $OUTFILE
+xpass grep -q 'loglevel=7' $OUTFILE
+
+$BOOTCONF -l -i ,beta-1.0 $INITRD > $OUTFILE
+xpass grep -q 'kernel.quiet[[:space:]]=[[:space:]]""' $OUTFILE
+xpass grep -q 'foo[[:space:]]=[[:space:]]"debug"' $OUTFILE
+xpass grep -q 'bar[[:space:]]=[[:space:]]"zero",[[:space:]]"two"' $OUTFILE
+
+$BOOTCONF -l -i +beta-1.0 $INITRD > $TEMPCONF
+xpass cmp $OUTFILE $TEMPCONF
+
+echo "Missing ID / index error and cross-file redefinition error"
+xfail $BOOTCONF -l -i missing $INITRD
+xfail $BOOTCONF -l -i 9 $INITRD
+xfail $BOOTCONF -l -i ,_alpha $INITRD
+$BOOTCONF -l -i ,_alpha $INITRD 2> $OUTFILE || true
+xpass grep -q 'Error[[:space:]]in[[:space:]]bootconfig[[:space:]]\[1:_alpha\]' $OUTFILE
+
+echo "Selective delete and delete all"
+xfail $BOOTCONF -d -i missing $INITRD
+xpass $BOOTCONF -d -i _alpha $INITRD
+$BOOTCONF $INITRD > $OUTFILE
+xpass grep -q '\[0\][[:space:]](default)' $OUTFILE
+xpass grep -q '\[1\][[:space:]]#BOOTCONFIG-ID:[[:space:]]beta-1.0' $OUTFILE
+xfail grep -q '_alpha' $OUTFILE
+
+xpass $BOOTCONF -d -i 0 $INITRD
+$BOOTCONF $INITRD > $OUTFILE
+xpass grep -q '\[0\][[:space:]]#BOOTCONFIG-ID:[[:space:]]beta-1.0' $OUTFILE
+xfail grep -q 'quiet' $OUTFILE
+
+xpass $BOOTCONF -d $INITRD
+xpass test $orig_size -eq $(wc -c < $INITRD)
+
+echo "Max stacked configs (32) limit check"
+i=0
+while [ $i -lt 32 ]; do
+  printf "k_%d = v_%d\n" $i $i > $TEMPCONF
+  if ! $BOOTCONF -i "cfg_$i" -a $TEMPCONF $INITRD > /dev/null; then
+    break
+  fi
+  i=$((i + 1))
+done
+xpass test $i -eq 32
+printf "k_extra = 1\n" > $TEMPCONF
+xfail $BOOTCONF -i cfg_32 -a $TEMPCONF $INITRD
+$BOOTCONF -l -i 31 $INITRD > $OUTFILE
+xpass grep -q 'k_31[[:space:]]=[[:space:]]"v_31"' $OUTFILE
+xpass $BOOTCONF -d $INITRD
+xpass test $orig_size -eq $(wc -c < $INITRD)
+
+echo "Total stacked size > 32KB with valid per-selection size"
+printf "big1 = \"" > $TEMPCONF
+dd if=/dev/zero bs=1 count=20000 2>/dev/null | tr '\0' 'a' >> $TEMPCONF
+printf "\"\n" >> $TEMPCONF
+xpass $BOOTCONF -i big1 -a $TEMPCONF $INITRD
+printf "big2 = \"" > $TEMPCONF
+dd if=/dev/zero bs=1 count=20000 2>/dev/null | tr '\0' 'b' >> $TEMPCONF
+printf "\"\n" >> $TEMPCONF
+xpass $BOOTCONF -i big2 -a $TEMPCONF $INITRD
+$BOOTCONF -l -i big1 $INITRD > $OUTFILE
+xpass grep -q 'big1[[:space:]]=' $OUTFILE
+$BOOTCONF -l -i big2 $INITRD > $OUTFILE
+xpass grep -q 'big2[[:space:]]=' $OUTFILE
+xfail $BOOTCONF -l -i big1,big2 $INITRD
+xpass $BOOTCONF -d $INITRD
+xpass test $orig_size -eq $(wc -c < $INITRD)
+
 
 echo
 echo "=== Summary ==="
