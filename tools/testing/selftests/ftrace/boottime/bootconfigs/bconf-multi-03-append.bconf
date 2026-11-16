@@ -1,0 +1,6 @@
+kernel.bconf_append_key = base_val
+ftrace.instance.app_inst {
+	event.sched.sched_switch {
+		enable
+	}
+}

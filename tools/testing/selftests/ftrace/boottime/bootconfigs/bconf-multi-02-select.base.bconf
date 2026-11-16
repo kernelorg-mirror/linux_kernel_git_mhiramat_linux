@@ -1,0 +1,7 @@
+kernel.bconf_test_arg = from_base
+ftrace.instance.base_inst {
+	buffer_size = 512K
+	event.sched.sched_switch {
+		enable
+	}
+}

@@ -1,0 +1,5 @@
+ftrace.instance.dbg_inst {
+	event.sched.sched_wakeup {
+		enable
+	}
+}

@@ -218,6 +218,17 @@ run_single_test() {
 		bconf_file="$dir/$name.bconf"
 	fi
 
+	local named_bconfs=()
+	local f
+	for f in "$SCRIPT_DIR/bootconfigs/$name".*.bconf "$dir/$name".*.bconf; do
+		if [ -f "$f" ]; then
+			named_bconfs+=("$f")
+		fi
+	done
+
+	local inline_bconfs
+	inline_bconfs="$(grep -E '^# *BOOTCONFIGS:' "$test_script" | sed 's/^# *BOOTCONFIGS://' | xargs || true)"
+
 	local test_cmdline=""
 	if [ -f "$SCRIPT_DIR/cmdlines/$name.cmdline" ]; then
 		test_cmdline="$(cat "$SCRIPT_DIR/cmdlines/$name.cmdline")"
@@ -324,9 +335,49 @@ EOF
 		"$BOOTCONFIG" -a "$bconf_file" "$initramfs" > /dev/null
 	fi
 
+	for f in "${named_bconfs[@]}"; do
+		local id
+		id="$(basename "$f" .bconf)"
+		id="${id#"$name".}"
+		"$BOOTCONFIG" -i "$id" -a "$f" "$initramfs" > /dev/null
+	done
+
+	if [ -n "$inline_bconfs" ]; then
+		local item b_id b_file b_path
+		for item in $inline_bconfs; do
+			case "$item" in
+				*:*)
+					b_id="${item%%:*}"
+					b_file="${item#*:}"
+					;;
+				*)
+					b_id=""
+					b_file="$item"
+					;;
+			esac
+			if [ -f "$SCRIPT_DIR/bootconfigs/$b_file" ]; then
+				b_path="$SCRIPT_DIR/bootconfigs/$b_file"
+			elif [ -f "$dir/$b_file" ]; then
+				b_path="$dir/$b_file"
+			else
+				ktap_test_fail "$name (bootconfig file '$b_file' not found)"
+				rm -rf "$workdir"
+				trap - EXIT
+				return 0
+			fi
+			if [ -n "$b_id" ]; then
+				"$BOOTCONFIG" -i "$b_id" -a "$b_path" "$initramfs" > /dev/null
+			else
+				"$BOOTCONFIG" -a "$b_path" "$initramfs" > /dev/null
+			fi
+		done
+	fi
 
 	local logfile
-	local base_cmdline="bootconfig console=tty0 console=ttyS0 panic=-1"
+	local base_cmdline="console=tty0 console=ttyS0 panic=-1"
+	if ! [[ "$test_cmdline" =~ (^|[[:space:]])bootconfig(=|[[:space:]]|$) ]]; then
+		base_cmdline="bootconfig $base_cmdline"
+	fi
 	if [ -n "$test_cmdline" ]; then
 		base_cmdline="$base_cmdline $test_cmdline"
 	fi

@@ -1,0 +1,7 @@
+kernel.bconf_test_arg := from_dbg
+ftrace.instance.base_inst.buffer_size := 2048K
+ftrace.instance.dbg_inst {
+	event.sched.sched_wakeup {
+		enable
+	}
+}

@@ -1,0 +1,5 @@
+ftrace.instance.def_inst {
+	event.sched.sched_switch {
+		enable
+	}
+}

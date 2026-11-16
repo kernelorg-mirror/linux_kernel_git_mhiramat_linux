@@ -16,7 +16,9 @@ results according to TAP version 13 format.
 Test Specification Format
 -------------------------
 For each test script `tests/<name>.sh`, the harness dynamically detects:
-- `bootconfigs/<name>.bconf` or `<name>.bconf`: Bootconfig configuration file.
+- `bootconfigs/<name>.bconf` or `<name>.bconf`: Bootconfig configuration file (default / index 0).
+- `bootconfigs/<name>.<id>.bconf` or `<name>.<id>.bconf`: Named bootconfig configuration file attached with `-i <id>`.
+- `# BOOTCONFIGS: [<id>:]<file> ...` header in script: Explicit list of unnamed or named (`<id>:<file>`) bootconfig files to attach.
 - `cmdlines/<name>.cmdline` or `# CMDLINE: <opts>` header in script: Kernel boot parameters.
 - `qemuopts/<name>.qemuopts` or `# QEMUOPTS: <opts>` header in script: Additional QEMU CLI arguments.
 - `# APPLETS: <applets>` header in script: Additional BusyBox applet symlinks to create in initramfs.

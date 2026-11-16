@@ -1,0 +1,5 @@
+ftrace.instance.alt_inst {
+	event.sched.sched_switch {
+		enable
+	}
+}
