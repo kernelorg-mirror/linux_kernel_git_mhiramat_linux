@@ -199,11 +199,11 @@ to/from initrd image. You can build it by the following command::
  # make -C tools/bootconfig
 
 To add your boot config file to initrd image, run bootconfig as below
-(Old data is removed automatically if exists)::
+(Old default data is replaced if it exists)::
 
  # tools/bootconfig/bootconfig -a your-config /boot/initrd.img-X.Y.Z
 
-To remove the config from the image, you can use -d option as below::
+To remove all boot config files from the image, use the -d option as below::
 
  # tools/bootconfig/bootconfig -d /boot/initrd.img-X.Y.Z
 
@@ -211,6 +211,51 @@ Then add "bootconfig" on the normal kernel command line to tell the
 kernel to look for the bootconfig at the end of the initrd file.
 Alternatively, build your kernel with the ``CONFIG_BOOT_CONFIG_FORCE``
 Kconfig option selected.
+
+Attaching Multiple Boot Configs to Initrd
+-----------------------------------------
+
+Multiple bootconfig files (up to 32) can be stacked at the end of an initrd
+image, which is useful for Unified Kernel Images (UKIs) that bundle a base
+configuration alongside scenario-specific or debug overlays::
+
+ [initrd][block 0 (default)][block 1 (id1)][block 2 (id2)]...
+
+Each block has its own ``#BOOTCONFIG\n`` footer. Named blocks carry an
+in-band comment header on their first line (``#BOOTCONFIG-ID: <id>\n``).
+Identifiers must be 1 to 31 characters long, start with an ASCII letter or
+underscore (``[A-Za-z_]`` — leading digits are reserved for 0-based indices),
+and contain only ASCII letters, digits, ``_``, ``-``, or ``.``.
+
+To attach or replace a named bootconfig, pass ``-i <id>`` to ``bootconfig``::
+
+ # tools/bootconfig/bootconfig -a base.bconf /boot/initrd.img-X.Y.Z
+ # tools/bootconfig/bootconfig -i debug -a debug.bconf /boot/initrd.img-X.Y.Z
+ # tools/bootconfig/bootconfig -i trace -a trace.bconf /boot/initrd.img-X.Y.Z
+
+To inspect or preview the merged result on the host, or selectively delete
+configs::
+
+ # tools/bootconfig/bootconfig /boot/initrd.img-X.Y.Z
+ # tools/bootconfig/bootconfig -l -i ,debug /boot/initrd.img-X.Y.Z
+ # tools/bootconfig/bootconfig -d -i debug /boot/initrd.img-X.Y.Z
+
+The first attached block (index ``0``, or the unnamed default block if present)
+is the default bootconfig. At boot time, ``bootconfig`` parameters before
+``--`` are evaluated left-to-right:
+
+- ``bootconfig`` (bare): selects only the default config (index ``0``).
+- ``bootconfig=id1,id2`` (or ``bootconfig=0,2``): selects and merges the
+  listed IDs or 0-based indices in initrd stack order. An empty entry such as
+  ``bootconfig=,debug`` is shorthand for ``0,debug``.
+- ``bootconfig=+debug``: appends ``debug`` onto an earlier ``bootconfig=...``
+  selection on the command line (or onto index ``0`` if no prior
+  ``bootconfig`` parameter appeared).
+- ``bootconfig=`` (empty value): clears earlier selections and loads no
+  bootconfig (unless ``CONFIG_BOOT_CONFIG_FORCE=y`` is set).
+
+Selected configs are merged in stack order (index ``0`` first, later overlays
+after), so overlays can use ``:=`` and ``+=`` to override or extend base keys.
 
 Embedding a Boot Config into Kernel
 -----------------------------------
@@ -366,6 +411,11 @@ size is smaller than 32KB. (Note that this maximum size is not including
 the padding null characters.)
 Anyway, since bootconfig command verifies it when appending a boot config
 to initrd image, user can notice it before boot.
+
+When stacking multiple bootconfig files in an initrd, up to 32 files can be
+attached. Each individual file must fit within 32KB, while the combined size
+of all stacked files in the initrd may exceed 32KB as long as the subset
+selected at boot fits within 32KB and the node limit.
 
 
 Bootconfig APIs

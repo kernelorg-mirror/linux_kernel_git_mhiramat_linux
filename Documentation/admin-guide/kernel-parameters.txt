@@ -652,8 +652,16 @@ Kernel parameters
 			Format: integer
 
 	bootconfig	[KNL,EARLY]
+	bootconfig=[+][<id_or_index>[,...]]
 			Extended command line options can be added to an initrd
 			and this will cause the kernel to look for it.
+			When multiple bootconfig files are attached to the
+			initrd, a comma-separated list of identifiers or
+			0-based indices selects which configs to load and merge
+			in stack order. Bare "bootconfig" selects the first
+			(default, index 0) config; leading "+" appends to a
+			prior selection (or to index 0 if none preceded it);
+			empty "bootconfig=" clears any prior selection.
 
 			See Documentation/admin-guide/bootconfig.rst
 
