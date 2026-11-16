@@ -1084,13 +1084,15 @@ static int __init xbc_verify_tree(void)
 }
 
 /* Need to setup xbc_data and xbc_nodes before call this. */
-static int __init xbc_parse_tree(void)
+static int __init xbc_parse_tree(char *data, size_t size)
 {
 	char *p, *q;
 	int ret = 0, c;
+	struct xbc_node *n;
 
 	last_parent = NULL;
-	p = xbc_data;
+	brace_index = 0;
+	p = data;
 	do {
 		q = strpbrk(p, "{}=+;:\n#");
 		if (!q) {
@@ -1133,10 +1135,211 @@ static int __init xbc_parse_tree(void)
 	} while (!ret);
 
 	if (!ret) {
-		while (p < xbc_data + xbc_data_size - 1 && *p == '\0')
+		while (p < data + size && *p == '\0')
 			p++;
-		if (p < xbc_data + xbc_data_size - 1)
+		if (p < data + size)
 			ret = xbc_parse_error("Unexpected data after null character", p);
+	}
+
+	if (!ret && brace_index) {
+		n = &xbc_nodes[open_brace[brace_index - 1]];
+		ret = xbc_parse_error("Brace is not closed",
+				      xbc_node_get_data(n));
+	}
+
+	return ret;
+}
+
+/**
+ * xbc_valid_id() - Validate a bootconfig identifier string
+ * @id: Identifier string (not required to be NUL-terminated)
+ * @len: Length of @id in bytes
+ *
+ * A valid bootconfig ID has length 1..BOOTCONFIG_ID_MAX - 1, starts with an
+ * ASCII letter or underscore (digits are reserved for index numbers), and
+ * contains only ASCII letters, digits, '_', '-', or '.'.
+ *
+ * Return: true if @id is valid, false otherwise.
+ */
+bool __init xbc_valid_id(const char *id, size_t len)
+{
+	size_t i;
+
+	if (!id || len == 0 || len >= BOOTCONFIG_ID_MAX)
+		return false;
+
+	if (!(('a' <= id[0] && id[0] <= 'z') ||
+	      ('A' <= id[0] && id[0] <= 'Z') ||
+	      id[0] == '_'))
+		return false;
+
+	for (i = 1; i < len; i++) {
+		char c = id[i];
+
+		if (!(('a' <= c && c <= 'z') ||
+		      ('A' <= c && c <= 'Z') ||
+		      ('0' <= c && c <= '9') ||
+		      c == '_' || c == '-' || c == '.'))
+			return false;
+	}
+
+	return true;
+}
+
+/**
+ * xbc_parse_id_header() - Parse optional #BOOTCONFIG-ID header from a block
+ * @data: Writable bootconfig block buffer (may have trailing NUL padding)
+ * @size: Size of @data in bytes
+ * @cfg: Output descriptor to populate
+ *
+ * Strip trailing NUL padding from @data and check if line 1 starts with
+ * "#BOOTCONFIG-ID: <id>\n". If present, validate <id>, NUL-terminate it in
+ * place, and point @cfg->name at <id> and @cfg->data past the newline.
+ * Otherwise set @cfg->name to "" and @cfg->data to @data.
+ *
+ * Return: 0 on success, or -EINVAL if a malformed ID header is present.
+ */
+int __init xbc_parse_id_header(char *data, size_t size, struct xbc_config *cfg)
+{
+	char *id, *nl;
+
+	while (size > 0 && data[size - 1] == '\0')
+		size--;
+
+	cfg->enabled = false;
+	if (size >= BOOTCONFIG_ID_PREFIX_LEN &&
+	    !memcmp(data, BOOTCONFIG_ID_PREFIX, BOOTCONFIG_ID_PREFIX_LEN)) {
+		id = data + BOOTCONFIG_ID_PREFIX_LEN;
+		nl = memchr(id, '\n', size - BOOTCONFIG_ID_PREFIX_LEN);
+		if (!nl || !xbc_valid_id(id, nl - id))
+			return -EINVAL;
+		*nl = '\0';
+		cfg->name = id;
+		cfg->data = nl + 1;
+		cfg->size = size - (size_t)(cfg->data - data);
+	} else {
+		cfg->name = "";
+		cfg->data = data;
+		cfg->size = size;
+	}
+
+	return 0;
+}
+
+static int __init xbc_parse_index(const char *p, size_t len)
+{
+	unsigned int idx = 0;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		if (p[i] < '0' || p[i] > '9')
+			return -EINVAL;
+		idx = idx * 10 + (p[i] - '0');
+		if (idx >= XBC_CONFIG_MAX)
+			return -ERANGE;
+	}
+
+	return (int)idx;
+}
+
+/**
+ * xbc_enable_configs() - Update enabled flags on bootconfig entries from spec
+ * @cfgs: Array of bootconfig descriptors
+ * @count: Number of entries in @cfgs
+ * @spec: Selection spec (NULL for default, "" to clear, "[+]<id_or_idx>,...")
+ * @seeded: Tracks whether a prior selection has already been applied
+ *
+ * Update @cfgs[i].enabled according to @spec:
+ * - NULL: clears all entries and enables @cfgs[0] (default).
+ * - "": clears all entries.
+ * - "+...": keeps existing enabled flags (seeding @cfgs[0] if !*@seeded),
+ *   then enables listed IDs/indices.
+ * - "<id_or_idx>,...": clears all entries, then enables listed IDs/indices.
+ *
+ * An empty comma-separated token selects @cfgs[0]. Numeric tokens select by
+ * 0-based index; identifier tokens match @cfgs[i].name.
+ *
+ * Return: 0 if all requested entries matched, or -ENOENT if any was missing.
+ */
+int __init xbc_enable_configs(struct xbc_config *cfgs, int count,
+			      const char *spec, bool *seeded)
+{
+	const char *p, *comma;
+	int i, idx, ret = 0;
+	size_t len;
+
+	if (!spec) {
+		for (i = 0; i < count; i++)
+			cfgs[i].enabled = false;
+		if (count > 0)
+			cfgs[0].enabled = true;
+		if (seeded)
+			*seeded = true;
+		return 0;
+	}
+
+	if (*spec == '\0') {
+		for (i = 0; i < count; i++)
+			cfgs[i].enabled = false;
+		if (seeded)
+			*seeded = true;
+		return 0;
+	}
+
+	if (*spec == '+') {
+		spec++;
+		if ((!seeded || !*seeded) && count > 0)
+			cfgs[0].enabled = true;
+		if (seeded)
+			*seeded = true;
+		if (*spec == '\0')
+			return 0;
+	} else {
+		for (i = 0; i < count; i++)
+			cfgs[i].enabled = false;
+		if (seeded)
+			*seeded = true;
+	}
+
+	p = spec;
+	while (1) {
+		comma = strchr(p, ',');
+		len = comma ? (size_t)(comma - p) : strlen(p);
+		if (len == 0) {
+			if (count > 0) {
+				cfgs[0].enabled = true;
+			} else {
+				pr_err("bootconfig: default config not found\n");
+				ret = -ENOENT;
+			}
+		} else if (p[0] >= '0' && p[0] <= '9') {
+			idx = xbc_parse_index(p, len);
+			if (idx >= 0 && idx < count) {
+				cfgs[idx].enabled = true;
+			} else {
+				pr_err("bootconfig: '%.*s' not found\n",
+				       (int)len, p);
+				ret = -ENOENT;
+			}
+		} else {
+			bool matched = false;
+
+			for (i = 0; i < count; i++) {
+				if (strlen(cfgs[i].name) == len &&
+				    !strncmp(cfgs[i].name, p, len)) {
+					cfgs[i].enabled = true;
+					matched = true;
+				}
+			}
+			if (!matched) {
+				pr_err("bootconfig: '%.*s' not found\n",
+				       (int)len, p);
+				ret = -ENOENT;
+			}
+		}
+		if (!comma)
+			break;
+		p = comma + 1;
 	}
 
 	return ret;
@@ -1161,6 +1364,145 @@ void __init xbc_exit(void)
 }
 
 /**
+ * xbc_init_configs() - Parse enabled XBC configs and build XBC internal tree
+ * @cfgs: Array of bootconfig descriptors
+ * @count: Number of entries in @cfgs
+ * @emsg: A pointer of const char * to store the error message
+ * @epos: A pointer of int to store the error position (local to failing config)
+ * @err_idx: If non-NULL, set to index in @cfgs of the failing config on error
+ *
+ * Concatenate all enabled entries in @cfgs into a single buffer of at most
+ * XBC_DATA_MAX bytes and parse each slice into the XBC tree.
+ * Return the number of stored nodes (>0) if succeeded, or -errno on error.
+ */
+int __init xbc_init_configs(const struct xbc_config *cfgs, int count,
+			    const char **emsg, int *epos, int *err_idx)
+{
+	size_t total_size = 0;
+	int i, ret = 0, enabled = 0;
+	char *dst;
+
+	if (epos)
+		*epos = -1;
+	if (err_idx)
+		*err_idx = -1;
+
+	if (xbc_data) {
+		if (emsg)
+			*emsg = "Bootconfig is already initialized";
+		return -EBUSY;
+	}
+
+	for (i = 0; i < count; i++) {
+		if (!cfgs[i].enabled || cfgs[i].size == 0)
+			continue;
+		if (enabled > 0) {
+			if (total_size >= XBC_DATA_MAX) {
+				if (emsg)
+					*emsg = "Config data is too big";
+				return -ERANGE;
+			}
+			total_size++;
+		}
+		if (cfgs[i].size > XBC_DATA_MAX - total_size) {
+			if (emsg)
+				*emsg = "Config data is too big";
+			return -ERANGE;
+		}
+		total_size += cfgs[i].size;
+		enabled++;
+	}
+
+	if (total_size == 0) {
+		if (emsg)
+			*emsg = "Config data is empty";
+		return -ERANGE;
+	}
+
+	xbc_data = xbc_alloc_mem(total_size + 1);
+	if (!xbc_data) {
+		if (emsg)
+			*emsg = "Failed to allocate bootconfig data";
+		return -ENOMEM;
+	}
+
+	dst = xbc_data;
+	enabled = 0;
+	for (i = 0; i < count; i++) {
+		if (!cfgs[i].enabled || cfgs[i].size == 0)
+			continue;
+		if (enabled > 0)
+			*dst++ = '\0';
+		memcpy(dst, cfgs[i].data, cfgs[i].size);
+		dst += cfgs[i].size;
+		enabled++;
+	}
+	*dst = '\0';
+	xbc_data_size = total_size + 1;
+
+	xbc_nodes = xbc_alloc_mem(sizeof(struct xbc_node) * XBC_NODE_MAX);
+	if (!xbc_nodes) {
+		if (emsg)
+			*emsg = "Failed to allocate bootconfig nodes";
+		xbc_exit();
+		return -ENOMEM;
+	}
+
+	dst = xbc_data;
+	enabled = 0;
+	for (i = 0; i < count; i++) {
+		if (!cfgs[i].enabled || cfgs[i].size == 0)
+			continue;
+		if (enabled > 0)
+			dst++;
+		ret = xbc_parse_tree(dst, cfgs[i].size);
+		if (ret < 0)
+			break;
+		dst += cfgs[i].size;
+		enabled++;
+	}
+
+	if (!ret)
+		ret = xbc_verify_tree();
+#ifndef __KERNEL__
+	if (!ret)
+		ret = xbc_sanity_check_tree();
+#endif
+
+	if (ret < 0) {
+		if (xbc_err_pos >= 0) {
+			size_t off = 0;
+
+			enabled = 0;
+			for (i = 0; i < count; i++) {
+				if (!cfgs[i].enabled || cfgs[i].size == 0)
+					continue;
+				if (enabled > 0)
+					off++;
+				if ((size_t)xbc_err_pos >= off &&
+				    (size_t)xbc_err_pos <= off + cfgs[i].size) {
+					if (err_idx)
+						*err_idx = i;
+					xbc_err_pos -= (int)off;
+					break;
+				}
+				off += cfgs[i].size;
+				enabled++;
+			}
+		}
+		if (epos)
+			*epos = xbc_err_pos;
+		if (emsg)
+			*emsg = xbc_err_msg;
+		xbc_exit();
+	} else {
+		ret = xbc_node_num;
+	}
+
+	return ret;
+}
+
+/**
  * xbc_init() - Parse given XBC file and build XBC internal tree
  * @data: The boot config text original data
  * @size: The size of @data
@@ -1177,58 +1519,12 @@ void __init xbc_exit(void)
  */
 int __init xbc_init(const char *data, size_t size, const char **emsg, int *epos)
 {
-	int ret;
+	struct xbc_config cfg = {
+		.name = "",
+		.data = data,
+		.size = size,
+		.enabled = true,
+	};
 
-	if (epos)
-		*epos = -1;
-
-	if (xbc_data) {
-		if (emsg)
-			*emsg = "Bootconfig is already initialized";
-		return -EBUSY;
-	}
-	if (size > XBC_DATA_MAX || size == 0) {
-		if (emsg)
-			*emsg = size ? "Config data is too big" :
-				"Config data is empty";
-		return -ERANGE;
-	}
-
-	xbc_data = xbc_alloc_mem(size + 1);
-	if (!xbc_data) {
-		if (emsg)
-			*emsg = "Failed to allocate bootconfig data";
-		return -ENOMEM;
-	}
-	memcpy(xbc_data, data, size);
-	xbc_data[size] = '\0';
-	xbc_data_size = size + 1;
-
-	xbc_nodes = xbc_alloc_mem(sizeof(struct xbc_node) * XBC_NODE_MAX);
-	if (!xbc_nodes) {
-		if (emsg)
-			*emsg = "Failed to allocate bootconfig nodes";
-		xbc_exit();
-		return -ENOMEM;
-	}
-
-	ret = xbc_parse_tree();
-	if (!ret)
-		ret = xbc_verify_tree();
-#ifndef __KERNEL__
-	if (!ret)
-		ret = xbc_sanity_check_tree();
-#endif
-
-	if (ret < 0) {
-		if (epos)
-			*epos = xbc_err_pos;
-		if (emsg)
-			*emsg = xbc_err_msg;
-		xbc_exit();
-	} else {
-		ret = xbc_node_num;
-	}
-
-	return ret;
+	return xbc_init_configs(&cfg, 1, emsg, epos, NULL);
 }

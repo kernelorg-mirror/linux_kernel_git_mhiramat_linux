@@ -31,6 +31,20 @@ bool __init cmdline_has_extra_options(void);
 #define BOOTCONFIG_FOOTER_SIZE	\
 	(sizeof(uint32_t) * 2 + BOOTCONFIG_MAGIC_LEN)
 
+#define BOOTCONFIG_ID_PREFIX		"#BOOTCONFIG-ID: "
+#define BOOTCONFIG_ID_PREFIX_LEN	16
+/* Maximum length of bootconfig ID including NUL */
+#define BOOTCONFIG_ID_MAX		32
+/* Maximum number of stacked bootconfig files in initrd */
+#define XBC_CONFIG_MAX			32
+
+struct xbc_config {
+	const char *name;
+	const char *data;
+	size_t size;
+	bool enabled;
+};
+
 /**
  * xbc_calc_checksum() - Calculate checksum of bootconfig
  * @data: Bootconfig data.
@@ -298,6 +312,14 @@ static inline int __init xbc_node_compose_key(struct xbc_node *node,
 
 /* XBC node initializer */
 int __init xbc_init(const char *buf, size_t size, const char **emsg, int *epos);
+int __init xbc_init_configs(const struct xbc_config *cfgs, int count,
+			    const char **emsg, int *epos, int *err_idx);
+
+/* Multi-config ID and selection helpers */
+bool __init xbc_valid_id(const char *id, size_t len);
+int __init xbc_parse_id_header(char *data, size_t size, struct xbc_config *cfg);
+int __init xbc_enable_configs(struct xbc_config *cfgs, int count,
+			      const char *spec, bool *seeded);
 
 /* XBC node and size information */
 int __init xbc_get_info(int *node_size, size_t *data_size);

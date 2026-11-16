@@ -49,6 +49,10 @@ static inline char *strim(char *s)
 #define __init
 #define __initdata
 
+#ifndef pr_err
+#define pr_err(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__)
+#endif
+
 #include "../../../../include/linux/bootconfig.h"
 
 #endif
