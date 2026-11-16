@@ -266,67 +266,115 @@ static int __init loglevel(char *str)
 early_param("loglevel", loglevel);
 
 #ifdef CONFIG_BLK_DEV_INITRD
-static void * __init get_boot_config_from_initrd(size_t *_size)
+static int __init get_boot_config_from_initrd(struct xbc_config *cfgs,
+					      int max_cfgs, int *count)
 {
 	u32 size, csum;
 	char *data;
 	u8 *hdr;
-	int i;
+	int i, total = 0;
+	bool bad_id = false;
 
-	if (!initrd_end || initrd_end < initrd_start ||
-	    initrd_end - initrd_start < BOOTCONFIG_FOOTER_SIZE)
-		return NULL;
+	if (count)
+		*count = 0;
 
-	data = (char *)initrd_end - BOOTCONFIG_MAGIC_LEN;
-	/*
-	 * Since Grub may align the size of initrd to 4, we must
-	 * check the preceding 3 bytes as well.
-	 */
-	for (i = 0; i < 4; i++) {
-		if (!memcmp(data, BOOTCONFIG_MAGIC, BOOTCONFIG_MAGIC_LEN))
-			goto found;
-		data--;
-	}
-	return NULL;
-
+	while (initrd_end && initrd_end >= initrd_start &&
+	       initrd_end - initrd_start >= BOOTCONFIG_FOOTER_SIZE) {
+		data = (char *)initrd_end - BOOTCONFIG_MAGIC_LEN;
+		/*
+		 * Since Grub may align the size of initrd to 4, we must
+		 * check the preceding 3 bytes for the outermost trailer.
+		 */
+		if (total == 0) {
+			for (i = 0; i < 4; i++) {
+				if (!memcmp(data, BOOTCONFIG_MAGIC,
+					    BOOTCONFIG_MAGIC_LEN))
+					goto found;
+				data--;
+			}
+			break;
+		} else if (memcmp(data, BOOTCONFIG_MAGIC,
+				  BOOTCONFIG_MAGIC_LEN)) {
+			break;
+		}
 found:
-	hdr = (u8 *)(data - 8);
-	if ((unsigned long)hdr < initrd_start)
-		return NULL;
+		hdr = (u8 *)(data - 8);
+		if ((unsigned long)hdr < initrd_start)
+			break;
 
-	size = get_unaligned_le32(hdr);
-	csum = get_unaligned_le32(hdr + 4);
+		size = get_unaligned_le32(hdr);
+		csum = get_unaligned_le32(hdr + 4);
 
-	if (size > XBC_DATA_MAX) {
-		pr_err("bootconfig size %u is greater than max size %d\n",
-			size, XBC_DATA_MAX);
-		return NULL;
+		if (size > XBC_DATA_MAX) {
+			pr_err("bootconfig size %u is greater than max size %d\n",
+			       size, XBC_DATA_MAX);
+			break;
+		}
+
+		if (size > ((unsigned long)hdr - initrd_start)) {
+			pr_err("bootconfig size %u is greater than initrd size %lu\n",
+			       size, initrd_end - initrd_start);
+			break;
+		}
+
+		data = ((void *)hdr) - size;
+
+		if (xbc_calc_checksum(data, size) != csum) {
+			pr_err("bootconfig checksum failed\n");
+			break;
+		}
+
+		/* Remove bootconfig from initramfs/initrd */
+		initrd_end = (unsigned long)data;
+		total++;
+
+#ifdef CONFIG_BOOT_CONFIG
+		if (cfgs && total <= max_cfgs) {
+			if (xbc_parse_id_header(data, size,
+						&cfgs[max_cfgs - total]) < 0) {
+				pr_err("bootconfig: invalid bootconfig ID header\n");
+				bad_id = true;
+			}
+		}
+#endif
 	}
 
-	if (size > ((unsigned long)hdr - initrd_start)) {
-		pr_err("bootconfig size %u is greater than initrd size %lu\n",
-			size, initrd_end - initrd_start);
-		return NULL;
+	if (!cfgs || total == 0)
+		return 0;
+
+	if (total > max_cfgs) {
+		pr_err("bootconfig: too many bootconfigs in initrd (%d > %d)\n",
+		       total, max_cfgs);
+		return -E2BIG;
 	}
 
-	data = ((void *)hdr) - size;
+	if (bad_id)
+		return -EINVAL;
 
-	if (xbc_calc_checksum(data, size) != csum) {
-		pr_err("bootconfig checksum failed\n");
-		return NULL;
+	for (i = max_cfgs - total; i < max_cfgs; i++) {
+		int j;
+
+		if (!cfgs[i].name[0])
+			continue;
+		for (j = i + 1; j < max_cfgs; j++) {
+			if (!strcmp(cfgs[i].name, cfgs[j].name))
+				pr_warn("bootconfig: duplicate ID '%s' in initrd\n",
+					cfgs[i].name);
+		}
 	}
 
-	/* Remove bootconfig from initramfs/initrd */
-	initrd_end = (unsigned long)data;
-	if (_size)
-		*_size = size;
+	if (count)
+		*count = total;
 
-	return data;
+	return total;
 }
 #else
-static void * __init get_boot_config_from_initrd(size_t *_size)
+static int __init get_boot_config_from_initrd(struct xbc_config *cfgs,
+					      int max_cfgs, int *count)
 {
-	return NULL;
+	if (count)
+		*count = 0;
+	return 0;
 }
 #endif
 
@@ -431,29 +479,47 @@ static int __init warn_bootconfig(char *str)
 	return 0;
 }
 
+static struct xbc_config xbc_configs[XBC_CONFIG_MAX] __initdata;
+
 static void __init setup_boot_config(void)
 {
-	const char *msg, *data;
-	int pos, ret, offs;
-	size_t size;
+	const char *msg, *embed_data;
+	struct xbc_config *cfgs = NULL;
+	int pos, ret, offs, count = 0, err_idx = -1, i;
+	size_t size, enabled_size = 0;
 	bool from_embedded = false;
+	bool any_enabled = false;
 
-	/* Cut out the bootconfig data even if we have no bootconfig option */
-	data = get_boot_config_from_initrd(&size);
-	/* If there is no bootconfig in initrd, try embedded one. */
-	if (!data) {
-		data = xbc_get_embedded_bootconfig(&size);
-		from_embedded = true;
+	/* Cut out all bootconfig trailers even if we have no bootconfig option */
+	ret = get_boot_config_from_initrd(xbc_configs, XBC_CONFIG_MAX, &count);
+	if (ret < 0)
+		return;
+
+	if (count > 0) {
+		cfgs = &xbc_configs[XBC_CONFIG_MAX - count];
+	} else {
+		/* If there is no bootconfig in initrd, try embedded one. */
+		embed_data = xbc_get_embedded_bootconfig(&size);
+		if (embed_data) {
+			xbc_configs[0].name = "";
+			xbc_configs[0].data = embed_data;
+			xbc_configs[0].size = size;
+			xbc_configs[0].enabled = false;
+			cfgs = &xbc_configs[0];
+			count = 1;
+			from_embedded = true;
+		}
 	}
 
-	bootconfig_found = bootconfig_cmdline_requested(boot_command_line, &offs);
+	bootconfig_found = xbc_select_cmdline_configs(boot_command_line,
+						      cfgs, count, &offs);
 	if (!(bootconfig_found || IS_ENABLED(CONFIG_BOOT_CONFIG_FORCE)))
 		return;
 
 	/* Offset of the init arguments after a "--", located by the helper. */
 	initargs_offs = offs;
 
-	if (!data) {
+	if (!count) {
 		/* If user intended to use bootconfig, show an error level message */
 		if (bootconfig_found)
 			pr_err("'bootconfig' found on command line, but no bootconfig found\n");
@@ -462,16 +528,33 @@ static void __init setup_boot_config(void)
 		return;
 	}
 
-	ret = xbc_init(data, size, &msg, &pos);
+	if (!bootconfig_found && IS_ENABLED(CONFIG_BOOT_CONFIG_FORCE))
+		cfgs[0].enabled = true;
+
+	for (i = 0; i < count; i++) {
+		if (cfgs[i].enabled) {
+			any_enabled = true;
+			enabled_size += cfgs[i].size;
+		}
+	}
+	if (!any_enabled)
+		return;
+
+	ret = xbc_init_configs(cfgs, count, &msg, &pos, &err_idx);
 	if (ret < 0) {
-		if (pos < 0)
+		if (err_idx >= 0)
+			pr_err("Failed to parse bootconfig [%d%s%s]: %s at %d.\n",
+			       err_idx, cfgs[err_idx].name[0] ? ":" : "",
+			       cfgs[err_idx].name, msg, pos);
+		else if (pos < 0)
 			pr_err("Failed to init bootconfig: %s.\n", msg);
 		else
 			pr_err("Failed to parse bootconfig: %s at %d.\n",
-				msg, pos);
+			       msg, pos);
 	} else {
 		xbc_get_info(&ret, NULL);
-		pr_info("Load bootconfig: %ld bytes %d nodes\n", (long)size, ret);
+		pr_info("Load bootconfig: %zu bytes %d nodes\n",
+			enabled_size, ret);
 		/*
 		 * keys starting with "kernel." are passed via cmdline. When
 		 * this bootconfig came from the embedded source and
@@ -506,7 +589,7 @@ static void __init exit_boot_config(void)
 static void __init setup_boot_config(void)
 {
 	/* Remove bootconfig data from initrd */
-	get_boot_config_from_initrd(NULL);
+	get_boot_config_from_initrd(NULL, 0, NULL);
 }
 
 static int __init warn_bootconfig(char *str)

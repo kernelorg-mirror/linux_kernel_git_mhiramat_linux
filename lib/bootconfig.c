@@ -115,13 +115,66 @@ bool __init xbc_embedded_cmdline_applied(void)
 }
 #endif	/* CONFIG_CMDLINE_FROM_BOOTCONFIG */
 
-/* parse_args() callback: flag when the "bootconfig" parameter is present. */
-static int __init bootconfig_optin(char *param, char *val,
-				   const char *unused, void *arg)
+struct xbc_cmdline_select_ctx {
+	struct xbc_config *cfgs;
+	int count;
+	bool seen;
+	bool active;
+};
+
+/* parse_args() callback: track opt-in and update enabled bootconfig entries. */
+static int __init xbc_cmdline_select_cb(char *param, char *val,
+					const char *unused, void *arg)
 {
-	if (!strcmp(param, "bootconfig"))
-		*(bool *)arg = true;
+	struct xbc_cmdline_select_ctx *ctx = arg;
+
+	if (strcmp(param, "bootconfig"))
+		return 0;
+
+	if (!val) {
+		ctx->active = true;
+	} else if (*val == '\0') {
+		ctx->active = false;
+	} else if (*val == '+') {
+		if (!ctx->seen || val[1] != '\0')
+			ctx->active = true;
+	} else {
+		ctx->active = true;
+	}
+
+	if (ctx->cfgs)
+		xbc_enable_configs(ctx->cfgs, ctx->count, val, &ctx->seen);
+	else
+		ctx->seen = true;
+
 	return 0;
+}
+
+static bool __init xbc_parse_cmdline_bootconfig(const char *boot_cmdline,
+						struct xbc_config *cfgs,
+						int count, int *end_offset)
+{
+	static char tmp_cmdline[COMMAND_LINE_SIZE] __initdata;
+	struct xbc_cmdline_select_ctx ctx = {
+		.cfgs = cfgs,
+		.count = count,
+	};
+	char *err;
+
+	if (end_offset)
+		*end_offset = 0;
+
+	strscpy(tmp_cmdline, boot_cmdline, COMMAND_LINE_SIZE);
+	err = parse_args("bootconfig", tmp_cmdline, NULL, 0, 0, 0,
+			 &ctx, xbc_cmdline_select_cb);
+	if (IS_ERR(err))
+		return false;
+
+	/* parse_args() stops at "--" and returns the address of the rest. */
+	if (end_offset && err)
+		*end_offset = err - tmp_cmdline;
+
+	return ctx.active;
 }
 
 /**
@@ -131,33 +184,35 @@ static int __init bootconfig_optin(char *param, char *val,
  *		follow a "--" separator, or 0 when there is none
  *
  * Parse a private copy of @boot_cmdline (parse_args() is destructive) and
- * report whether "bootconfig" is present before the "--" separator.
+ * report whether "bootconfig" is active before the "--" separator.
  * setup_arch() uses this to gate prepending the build-time embedded cmdline;
- * setup_boot_config() uses it for the runtime opt-in and to locate the init
- * arguments via @end_offset. Sharing one parser keeps the early and late
- * paths agreeing on what counts as opt-in. CONFIG_BOOT_CONFIG_FORCE is not
- * folded in here; callers apply it where they need it.
+ * setup_boot_config() uses xbc_select_cmdline_configs() for runtime selection
+ * and to locate the init arguments via @end_offset. CONFIG_BOOT_CONFIG_FORCE
+ * is not folded in here; callers apply it where they need it.
  */
 bool __init bootconfig_cmdline_requested(const char *boot_cmdline, int *end_offset)
 {
-	static char tmp_cmdline[COMMAND_LINE_SIZE] __initdata;
-	bool found = false;
-	char *err;
+	return xbc_parse_cmdline_bootconfig(boot_cmdline, NULL, 0, end_offset);
+}
 
-	if (end_offset)
-		*end_offset = 0;
-
-	strscpy(tmp_cmdline, boot_cmdline, COMMAND_LINE_SIZE);
-	err = parse_args("bootconfig", tmp_cmdline, NULL, 0, 0, 0,
-			 &found, bootconfig_optin);
-	if (IS_ERR(err))
-		return false;
-
-	/* parse_args() stops at "--" and returns the address of the rest. */
-	if (end_offset && err)
-		*end_offset = err - tmp_cmdline;
-
-	return found;
+/**
+ * xbc_select_cmdline_configs() - Select bootconfig entries from cmdline
+ * @boot_cmdline: kernel command line to inspect (not modified)
+ * @cfgs: array of bootconfig descriptors from initrd or embedded fallback
+ * @count: number of entries in @cfgs
+ * @end_offset: if non-NULL, set to the offset of init arguments after "--"
+ *
+ * Evaluate all "bootconfig" parameters before "--" left-to-right and update
+ * @cfgs[i].enabled accordingly.
+ *
+ * Return: true if bootconfig remains active after parsing @boot_cmdline.
+ */
+bool __init xbc_select_cmdline_configs(const char *boot_cmdline,
+				       struct xbc_config *cfgs, int count,
+				       int *end_offset)
+{
+	return xbc_parse_cmdline_bootconfig(boot_cmdline, cfgs, count,
+					    end_offset);
 }
 
 #endif	/* __KERNEL__ */

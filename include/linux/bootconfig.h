@@ -340,6 +340,9 @@ static inline const char *xbc_get_embedded_bootconfig(size_t *size)
 /* Bootconfig opt-in detection, shared by setup_arch() and setup_boot_config() */
 #ifdef CONFIG_BOOT_CONFIG
 bool __init bootconfig_cmdline_requested(const char *boot_cmdline, int *end_offset);
+bool __init xbc_select_cmdline_configs(const char *boot_cmdline,
+				       struct xbc_config *cfgs, int count,
+				       int *end_offset);
 #endif
 
 /* Build-time-rendered bootconfig cmdline prepended in setup_arch() */
